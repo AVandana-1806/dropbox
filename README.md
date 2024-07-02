@@ -19,7 +19,7 @@ This Python script downloads PDF files from the Dropbox Sign API using the provi
 1. Navigate to the directory containing the script.
 2. Run the script with the API key as an argument
 ```bash
-python download_pdf.py <your_dropbox_sign_api_key>
+python dropbox_api.py <your_dropbox_sign_api_key>
 ```
 
 ## Output
