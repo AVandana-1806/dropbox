@@ -1,55 +1,94 @@
 import argparse
 import os
-
+import logging
 from dropbox_sign import ApiClient, ApiException, Configuration, apis
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Download PDF files from Dropbox Sign API")
-parser.add_argument("api_key", type=str, help="Dropbox Sign API key")
-args = parser.parse_args()
 
-configuration = Configuration(username=args.api_key)
-
-# Create a new folder in Dropbox to save the PDF files
 NEW_FOLDER_NAME = "dropbox"
-new_folder_path = f"{NEW_FOLDER_NAME}"
+PAGE_SIZE = 20
 
-with ApiClient(configuration) as api_client:
-    signature_request_api = apis.SignatureRequestApi(api_client)
-    try:
-        # Create a new folder locally
-        os.makedirs(new_folder_path, exist_ok=True)
 
-        PAGE = 1
-        PAGE_SIZE = 20
+def main(api_key):
+    """
+    Main function to set up the API client and initiate PDF download.
+    """
+    configuration = Configuration(username=api_key)
+    with ApiClient(configuration) as api_client:
+        signature_request_api = apis.SignatureRequestApi(api_client)
+        try:
+            download_pdf_files(signature_request_api)
+        except ApiException as e:
+            logging.error("Exception when calling Dropbox Sign API: %s", e)
 
-        while True:
-            response = signature_request_api.signature_request_list(
-                page=PAGE, page_size=PAGE_SIZE
+
+def download_pdf_files(signature_request_api):
+    """
+    Download PDF files from the Dropbox Sign API.
+    """
+    os.makedirs(NEW_FOLDER_NAME, exist_ok=True)
+    page = 1
+
+    while True:
+        try:
+            signature_request_list = signature_request_api.signature_request_list(
+                page=page, page_size=PAGE_SIZE
             )
+        except ApiException as e:
+            logging.error("Exception when retrieving signature requests: %s", e)
+            break
 
-            print(f"Total Documents: {response.list_info.num_results}")
+        total_results = signature_request_list.list_info.num_results
+        logging.info("Total Documents: %d", total_results)
 
-            total_results = response.list_info.num_results
+        for signature_request in signature_request_list.signature_requests:
+            download_pdf(signature_request, signature_request_api, NEW_FOLDER_NAME)
 
-            for item in response.signature_requests:
-                signature_request_id = item.signature_request_id
-                short_signature_request_id = signature_request_id[-6:]
+        if page * PAGE_SIZE < total_results:
+            page += 1
+        else:
+            break
 
-                file_response = signature_request_api.signature_request_files(
-                    signature_request_id, file_type="pdf"
-                )
-                file_path = (
-                    f"{new_folder_path}/{item.title}_{short_signature_request_id}.pdf"
-                )
 
-                print(f"Downloading file: {item.title}.pdf")
-                with open(file_path, "wb") as f:
-                    f.write(file_response.read())
+def download_pdf(signature_request, signature_request_api, folder_name):
+    """
+    Download a single PDF file from a signature request.
+    """
+    signature_request_id = signature_request.signature_request_id
+    short_signature_request_id = signature_request_id[-6:]
 
-            if (PAGE - 1) * PAGE_SIZE < total_results:
-                PAGE += 1
-            else:
-                break
+    try:
+        pdf_file_response = signature_request_api.signature_request_files(
+            signature_request_id, file_type="pdf"
+        )
     except ApiException as e:
-        print(f"Exception when calling Dropbox Sign API: {e}\n")
+        logging.error(
+            "Exception when downloading file for request %s: %s",
+            signature_request_id,
+            e,
+        )
+        return
+
+    file_path = os.path.join(
+        folder_name, f"{signature_request.title}_{short_signature_request_id}.pdf"
+    )
+    logging.info("Downloading file: %s", file_path)
+
+    try:
+        with open(file_path, "wb") as f:
+            f.write(pdf_file_response.read())
+    except IOError as e:
+        logging.error("Exception when writing file %s: %s", file_path, e)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Download PDF files from Dropbox Sign API"
+    )
+    parser.add_argument("api_key", type=str, help="Dropbox Sign API key")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    main(args.api_key)
