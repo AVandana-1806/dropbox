@@ -1,3 +1,13 @@
+"""
+This script downloads PDF files from the Dropbox Sign API.
+
+Usage:
+    python script_name.py <api_key>
+
+Arguments:
+    api_key: Dropbox Sign API key
+"""
+
 import argparse
 import os
 import logging
