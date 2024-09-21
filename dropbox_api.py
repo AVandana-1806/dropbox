@@ -102,7 +102,7 @@ def log_failed_download(title, signature_request_id, error):
     """
     Log the details of a failed download to a text file.
     """
-    with open(FAILED_DOWNLOADS_FILE, "a") as f:
+    with open(FAILED_DOWNLOADS_FILE, "a", encoding="utf-8") as f:
         f.write(
             f"Failed to download {title} (ID: {signature_request_id}) - Error: {error}\n"
         )
