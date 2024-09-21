@@ -16,6 +16,7 @@ from dropbox_sign import ApiClient, ApiException, Configuration, apis
 
 NEW_FOLDER_NAME = "dropbox"
 PAGE_SIZE = 20
+FAILED_DOWNLOADS_FILE = "failed_downloads.txt"
 
 
 def main(api_key):
@@ -37,6 +38,9 @@ def download_pdf_files(signature_request_api):
     """
     os.makedirs(NEW_FOLDER_NAME, exist_ok=True)
     page = 1
+
+    if os.path.exists(FAILED_DOWNLOADS_FILE):
+        os.remove(FAILED_DOWNLOADS_FILE)
 
     while True:
         try:
@@ -66,6 +70,8 @@ def download_pdf(signature_request, signature_request_api, folder_name):
     signature_request_id = signature_request.signature_request_id
     short_signature_request_id = signature_request_id[-6:]
 
+    sanitized_title = signature_request.title.replace("/", "_")
+
     try:
         pdf_file_response = signature_request_api.signature_request_files(
             signature_request_id, file_type="pdf"
@@ -76,10 +82,11 @@ def download_pdf(signature_request, signature_request_api, folder_name):
             signature_request_id,
             e,
         )
+        log_failed_download(sanitized_title, signature_request_id, e)
         return
 
     file_path = os.path.join(
-        folder_name, f"{signature_request.title}_{short_signature_request_id}.pdf"
+        folder_name, f"{sanitized_title}_{short_signature_request_id}.pdf"
     )
     logging.info("Downloading file: %s", file_path)
 
@@ -88,6 +95,18 @@ def download_pdf(signature_request, signature_request_api, folder_name):
             f.write(pdf_file_response.read())
     except IOError as e:
         logging.error("Exception when writing file %s: %s", file_path, e)
+        log_failed_download(sanitized_title, signature_request_id, e)
+
+
+def log_failed_download(title, signature_request_id, error):
+    """
+    Log the details of a failed download to a text file.
+    """
+    with open(FAILED_DOWNLOADS_FILE, "a", encoding="utf-8") as f:
+        f.write(
+            f"Failed to download {title} (ID: {signature_request_id}) - Error: {error}\n"
+        )
+    logging.info("Logged failed download: %s (ID: %s)", title, signature_request_id)
 
 
 if __name__ == "__main__":
