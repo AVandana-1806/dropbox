@@ -1,118 +1,166 @@
-@pytest.mark.asyncio
-async def test_create_environment_duplicate_rank(
-    test_client: AsyncClient, existing_environment
-):
-    """
-    Tests conflict when creating an environment with an already used rank.
-    """
-    payload = {
-        "name": fake.company(),
-        "description": "Duplicate rank",
-        "is_active": True,
-        "rank": existing_environment["rank"],
-    }
+    @staticmethod
+    async def list_application_versions(
+        db: AsyncSession,
+        skip: int = 0,
+        limit: int = 10,
+        application_name: Optional[str] = None,
+        environment_name: Optional[str] = None,
+        latest_only: bool = False,
+        manifest_sync: Optional[bool] = None,
+        expand: Optional[str] = None,
+    ) -> list[ApplicationVersion]:
+        """List application versions with optional filtering and metadata expansion."""
 
-    response = await test_client.post("/environments/", json=payload)
-    assert response.status_code == 409
+        include_metadata = expand == "metadata"
 
-    error = response.json()
-    assert "error" in error
-    assert (
-        error["error"]["message"]
-        == f"Environment with rank '{payload['rank']}' already exists"
-    )
+        if include_metadata:
+            query = (
+                select(
+                    ApplicationVersion,
+                    Application.name.label("application_name"),
+                    Environment.name.label("environment_name"),
+                    Repository.name.label("repository_name"),
+                )
+                .join(Application, Application.id == ApplicationVersion.application_id)
+                .join(Environment, Environment.id == ApplicationVersion.environment_id)
+                .join(Repository, Repository.id == Application.repository_id)
+            )
+            has_app_join = True
+            has_env_join = True
+        else:
+            query = select(ApplicationVersion)
+            has_app_join = False
+            has_env_join = False
 
+        if application_name:
+            if not has_app_join:
+                query = query.join(
+                    Application, Application.id == ApplicationVersion.application_id
+                )
+                has_app_join = True
+            query = query.where(Application.name == application_name)
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("rank", [0, -1, "abc", None])
-async def test_create_environment_invalid_rank(
-    test_client: AsyncClient, environment_payload, rank
-):
-    """
-    Tests that invalid rank values are rejected.
-    """
-    environment_payload["rank"] = rank
+        if environment_name:
+            if not has_env_join:
+                query = query.join(
+                    Environment, Environment.id == ApplicationVersion.environment_id
+                )
+                has_env_join = True
+            query = query.where(Environment.name == environment_name)
 
-    response = await test_client.post("/environments/", json=environment_payload)
-    assert response.status_code == 422
+        if manifest_sync is not None:
+            query = query.where(ApplicationVersion.manifest_sync == manifest_sync)
 
+        if latest_only:
+            latest_subq = select(
+                ApplicationVersion.application_id,
+                ApplicationVersion.environment_id,
+                func.max(ApplicationVersion.deployed_at).label("max_deployed"),
+            )
 
-@pytest.mark.asyncio
-async def test_create_environment_missing_rank(
-    test_client: AsyncClient, environment_payload
-):
-    """
-    Tests that rank is required on creation.
-    """
-    del environment_payload["rank"]
+            if application_name:
+                latest_subq = latest_subq.join(
+                    Application, Application.id == ApplicationVersion.application_id
+                ).where(Application.name == application_name)
 
-    response = await test_client.post("/environments/", json=environment_payload)
-    assert response.status_code == 422
+            if environment_name:
+                latest_subq = latest_subq.join(
+                    Environment, Environment.id == ApplicationVersion.environment_id
+                ).where(Environment.name == environment_name)
 
+            if manifest_sync is not None:
+                latest_subq = latest_subq.where(
+                    ApplicationVersion.manifest_sync == manifest_sync
+                )
 
+            latest_subq = latest_subq.group_by(
+                ApplicationVersion.application_id,
+                ApplicationVersion.environment_id,
+            ).subquery()
 
+            query = query.join(
+                latest_subq,
+                and_(
+                    ApplicationVersion.application_id == latest_subq.c.application_id,
+                    ApplicationVersion.environment_id == latest_subq.c.environment_id,
+                    ApplicationVersion.deployed_at == latest_subq.c.max_deployed,
+                ),
+            )
 
-@pytest.mark.asyncio
-async def test_update_environment_duplicate_rank(
-    test_client: AsyncClient, existing_environment, environment_payload
-):
-    """
-    Tests conflict when updating an environment to an already used rank.
-    """
-    other = await test_client.post("/environments/", json=environment_payload)
-    assert other.status_code == 201
-    other_environment = other.json()
+        query = (
+            query.order_by(ApplicationVersion.deployed_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
 
-    response = await test_client.patch(
-        f"/environments/{existing_environment['id']}",
-        json={"rank": other_environment["rank"]},
-    )
-    assert response.status_code == 409
+        result = await db.execute(query)
 
-    error = response.json()
-    assert "already exists" in error["error"]["message"]
+        if include_metadata:
+            versions = []
+            for av, app_name, env_name, repo_name in result.all():
+                av.application_name = app_name
+                av.environment_name = env_name
+                av.repository_name = repo_name
+                versions.append(av)
+            return versions
 
+        return list(result.scalars().all())
 
-@pytest.mark.asyncio
-async def test_update_environment_rank_only(
-    test_client: AsyncClient, existing_environment
-):
-    """
-    Tests updating only the rank of an environment.
-    """
-    response = await test_client.patch(
-        f"/environments/{existing_environment['id']}", json={"rank": 8888}
-    )
-    assert response.status_code == 200
-    assert response.json()["rank"] == 8888
+    @staticmethod
+    async def update_version_metadata(
+        db: AsyncSession,
+        data: ApplicationVersionUpdate,
+    ) -> ApplicationVersion:
+        """
+        Update a single application version's manifest_sync flag.
 
+        Behavior:
+        - If setting manifest_sync=True → ONLY update this row.
+        - If setting manifest_sync=False:
+            → mark this row as synced (manifest_synced_at=now())
+            → clear ALL stale rows for same (application_id, environment_id)
+            by setting manifest_sync=False.
+        """
+        row_q = await db.execute(
+            select(ApplicationVersion)
+            .join(Application, Application.id == ApplicationVersion.application_id)
+            .join(Environment, Environment.id == ApplicationVersion.environment_id)
+            .filter(
+                Application.name == data.application_name,
+                Environment.name == data.environment_name,
+                ApplicationVersion.version == data.version,
+            )
+        )
+        row = row_q.scalar_one_or_none()
+        if not row:
+            raise NotFoundException(
+                f"ApplicationVersion not found for {data.application_name}/{data.environment_name}/{data.version}"
+            )
 
-@pytest.mark.asyncio
-async def test_update_environment_same_rank_allowed(
-    test_client: AsyncClient, existing_environment
-):
-    """
-    Tests that updating an environment with its own rank is not a conflict.
-    """
-    response = await test_client.patch(
-        f"/environments/{existing_environment['id']}",
-        json={"rank": existing_environment["rank"]},
-    )
-    assert response.status_code == 200
+        app_id = row.application_id
+        env_id = row.environment_id
 
+        if data.manifest_sync:
+            row.manifest_sync = True
+            row.manifest_synced_at = None
+            await db.flush()
+            await db.refresh(row)
+            return row
 
+        row.manifest_sync = False
+        row.manifest_synced_at = func.now()
 
-@pytest.mark.asyncio
-async def test_recreate_environment_after_delete(
-    test_client: AsyncClient, existing_environment, environment_payload
-):
-    """
-    Tests that a soft-deleted environment's name and rank can be reused.
-    """
-    await test_client.delete(f"/environments/{existing_environment['id']}")
+        await db.execute(
+            ApplicationVersion.__table__.update()
+            .where(
+                ApplicationVersion.application_id == app_id,
+                ApplicationVersion.environment_id == env_id,
+                ApplicationVersion.id != row.id,
+                ApplicationVersion.manifest_sync == True,
+            )
+            .values(manifest_sync=False)
+        )
 
-    environment_payload["name"] = existing_environment["name"]
-    environment_payload["rank"] = existing_environment["rank"]
-
-    response = await test_client.post("/environments/", json=environment_payload)
-    assert response.status_code == 201
+        await db.flush()
+        await db.refresh(row)
+        return row
