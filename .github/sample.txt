@@ -2,37 +2,53 @@ Subject: MDM connector — what we can improve (config vs code)
 
 Hi all,
 
-Quick overview of what we can improve on the MDM connector, split into two groups: things we change in configuration (fast, no code release) and things that need code changes.
+Quick overview of what we can improve on the MDM connector, split into two groups: things we change in configuration (fast, no code release) and things that need code changes. Specific settings are in the appendix for anyone who wants that detail.
 
 **Configuration changes — quick wins, no release needed**
 
 - *Smaller work batches.* The connector currently takes on more work at once than it can finish in the time allowed, which forces it to restart the same batch repeatedly. Reducing the batch size fixes this. This is the main cause of the current backlog.
 - *Use all available data streams.* The topic provides 8 parallel streams; the connector is currently set up to read only 2. Using all 8 gives us roughly four times the processing capacity.
-- *Fixed capacity instead of auto-scaling.* Auto-scaling adds servers when CPU is high. This connector mostly waits on network responses, so CPU stays low and auto-scaling never triggers. Setting a fixed size is more predictable.
-- *Faster failure detection.* If a request to MDM or Salesforce hangs, we currently wait 30 seconds. Reducing that lets the connector recover sooner.
-- *A few missing settings* for provider records that are currently falling back to defaults pointing at a test environment.
+- *Fixed capacity instead of auto-scaling.* Auto-scaling adds servers when CPU is high. This connector mostly waits on network responses, so CPU stays low and auto-scaling never triggers. A fixed size is more predictable.
+- *Faster failure detection.* If a request to MDM or Salesforce hangs, we currently wait 30 seconds before giving up. Reducing that lets the connector recover sooner.
+- *A couple of settings for provider records should be explicit* rather than relying on built-in defaults. Nothing has been affected to date, but we'd rather not leave it to a default.
 
 **Code changes — need a release, more lasting benefit**
 
 - *Remove an unnecessary lookup.* Every person record currently makes an extra call to Salesforce that was designed to be batched but was never switched on. Enabling it removes roughly one call per record.
-- *Make the connector aware of its own deadline.* Today it accepts a batch of work with no sense of how long it has. Adding that awareness means it degrades gracefully instead of restarting from scratch.
+- *Make the connector aware of its own deadline.* Today it accepts a batch of work with no sense of how long it has to complete it. Adding that awareness means it degrades gracefully instead of restarting from scratch.
 - *Shut down cleanly.* When the connector restarts, in-progress work isn't allowed to finish first, so two versions can briefly overlap and duplicate effort.
-- *Isolate individual failures.* One unexpected error currently stops all work in progress rather than just that record.
+- *Isolate individual failures.* One unexpected error currently stops all work in progress rather than just the affected record.
 - *Prevent overlapping updates to the same person.* When two changes to the same person are processed at the same moment, one can silently overwrite the other.
-- *Two record types have no handler* and currently fail after retrying. Wiring them up stops the noise.
-
-**Separately — our deployment process**
-
-We found that configuration changes have not been reaching the deployed connector: the deployment reports success before the change is actually applied. We're fixing this first, since none of the configuration changes above would take effect otherwise. This is likely why earlier tuning attempts appeared to have no impact.
+- *Two record types have no handler* and currently fail after exhausting retries. Wiring them up removes that noise.
 
 **Suggested order**
 
-1. Fix the deployment process
-2. Apply the batch size change and confirm the backlog starts clearing
-3. Increase to all 8 streams
-4. Code changes in a following release
+1. Apply the batch size change and confirm the backlog starts clearing
+2. Increase to all 8 streams
+3. Code changes in a following release
 
-Steps 1 and 2 should resolve the immediate problem. The rest is about capacity and resilience.
+Step 1 should resolve the immediate backlog. The rest is capacity and resilience.
+
+---
+
+**Appendix — specific settings**
+
+The batch size change is two new entries in the connector properties:
+
+    consumer.override.max.poll.records=20
+    consumer.override.max.poll.interval.ms=900000
+
+Each Kafka message carries up to ~29 Trigger_Table__c ids. With the Kafka default of max.poll.records=500, a single batch can reach ~14,500 records — far longer than the 5-minute max.poll.interval.ms allows. The consumer is evicted mid-batch, uncommitted work is redelivered, and the cycle repeats. Setting max.poll.records=20 caps a batch at roughly 580 records, about 25-30 seconds of work.
+
+This is not sf.batch.size=200, which controls the Salesforce composite batch for status write-back and should stay as is.
+
+Other items referenced above:
+
+- tasks.max: 2 → 8 (matching the topic's 8 partitions)
+- capacity: switch from autoScaling to provisionedCapacity with a fixed worker count
+- http.response.timeout.seconds: 30 → 15
+- civica.provider.search.path and civica.provider.delete.path.template are currently unset and fall back to code defaults. The delete default embeds a SIT dataset name, so it would be wrong outside SIT — though no provider deletes have run, so nothing has been affected. We'll set both explicitly once the correct path is confirmed with the Civica team.
+- record.json.max.fields is set to 8 while Trigger_Table__c may expose 10 — worth confirming, as a record using fields 9 or 10 would have its payload silently truncated
 
 Happy to go into more detail on any of these.
 
