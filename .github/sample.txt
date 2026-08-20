@@ -54,3 +54,9 @@ Happy to go into more detail on any of these.
 
 Thanks,
 Adarsh
+
+
+tasks.max	Partitions per task	Parallelism used
+2 (today)	4 each	2 of 8
+8	1 each	8 of 8
+16	1 each for 8, rest idle	8 of 8 — extra tasks do nothing
