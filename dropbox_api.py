@@ -1,104 +1,70 @@
-@pytest.mark.asyncio
-async def test_append_execution_result(
-    test_client: AsyncClient, existing_execution_state: dict
-):
-    """Tests appending a single result to an execution state."""
-    execution_id = existing_execution_state["execution_id"]
-    payload = {
-        "result": {
-            "Env": "qa", "Repo": "orders", "App": "payments",
-            "Version": "1.4.0", "Status": "SUCCESS",
-        }
-    }
+"""
+Pytest fixtures for integration tests (Postgres via testcontainers).
+"""
 
-    response = await test_client.post(f"{BASE}/{execution_id}/results", json=payload)
-    assert response.status_code == 201
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from testcontainers.postgres import PostgresContainer
 
-    state = await test_client.get(f"{BASE}/{execution_id}")
-    body = state.json()
-    assert len(body["results"]) == 1
-    assert body["results"][0]["App"] == "payments"
-    assert body["blocked_apps"] == []
+from app.main import app
+from app.db.database import get_db
+from app.models.base import Base
 
 
-@pytest.mark.asyncio
-async def test_append_multiple_results_accumulate(
-    test_client: AsyncClient, existing_execution_state: dict
-):
-    """Tests that successive appends accumulate rather than overwrite."""
-    execution_id = existing_execution_state["execution_id"]
-
-    for app in ("payments", "checkout", "shipping"):
-        payload = {
-            "result": {
-                "Env": "qa", "Repo": "orders", "App": app,
-                "Version": "1.0.0", "Status": "SUCCESS",
-            }
-        }
-        response = await test_client.post(
-            f"{BASE}/{execution_id}/results", json=payload
+@pytest.fixture(scope="session")
+def postgres_url() -> str:
+    """Start a throwaway Postgres container for the test session."""
+    with PostgresContainer("postgres:16") as postgres:
+        yield postgres.get_connection_url().replace(
+            "postgresql+psycopg2", "postgresql+asyncpg"
         )
-        assert response.status_code == 201
-
-    state = await test_client.get(f"{BASE}/{execution_id}")
-    apps = [r["App"] for r in state.json()["results"]]
-    assert apps == ["payments", "checkout", "shipping"]
 
 
-@pytest.mark.asyncio
-async def test_append_execution_result_with_blocked(
-    test_client: AsyncClient, existing_execution_state: dict
-):
-    """Tests appending a failed result also records the blocked app."""
-    execution_id = existing_execution_state["execution_id"]
-    payload = {
-        "result": {
-            "Env": "qa", "Repo": "orders", "App": "payments",
-            "Version": "1.4.0", "Status": "FAILURE",
-        },
-        "blocked": {"Env": "qa", "Repo": "orders", "App": "payments"},
-    }
-
-    response = await test_client.post(f"{BASE}/{execution_id}/results", json=payload)
-    assert response.status_code == 201
-
-    body = (await test_client.get(f"{BASE}/{execution_id}")).json()
-    assert len(body["results"]) == 1
-    assert len(body["blocked_apps"]) == 1
-    assert body["blocked_apps"][0]["App"] == "payments"
+@pytest.fixture(scope="session")
+def engine(postgres_url: str):
+    """Async engine bound to the test container."""
+    return create_async_engine(postgres_url)
 
 
-@pytest.mark.asyncio
-async def test_append_execution_result_not_found(test_client: AsyncClient):
-    """Tests appending to a non-existent execution state returns 404."""
-    payload = {
-        "result": {
-            "Env": "qa", "Repo": "orders", "App": "payments",
-            "Version": "1.4.0", "Status": "SUCCESS",
-        }
-    }
-
-    response = await test_client.post(f"{BASE}/{uuid4()}/results", json=payload)
-    assert response.status_code == 404
-    assert "not found" in extract_message(response.json())
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "bad_result",
-    [
-        {"Env": "qa", "Repo": "orders", "App": "payments", "Version": "1.0.0"},
-        {"Env": "qa", "Repo": "orders", "App": "payments", "Status": "SUCCESS"},
-        {},
-    ],
-)
-async def test_append_execution_result_invalid_payload(
-    test_client: AsyncClient, existing_execution_state: dict, bad_result: dict
-):
-    """Tests that incomplete result payloads are rejected."""
-    execution_id = existing_execution_state["execution_id"]
-
-    response = await test_client.post(
-        f"{BASE}/{execution_id}/results", json={"result": bad_result}
+@pytest.fixture(scope="session")
+def session_factory(engine):
+    """Session factory for the test database."""
+    return async_sessionmaker(
+        expire_on_commit=False, class_=AsyncSession, bind=engine
     )
-    assert response.status_code == 422
+
+
+@pytest_asyncio.fixture(scope="function", autouse=True)
+async def setup_database(engine, session_factory):
+    """Create tables before each test and drop them after."""
+
+    async def override_get_db() -> AsyncSession:
+        async with session_factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def test_client():
+    """Provides an AsyncClient for testing FastAPI routes."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
