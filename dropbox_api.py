@@ -1,96 +1,69 @@
-    @staticmethod
-    def _version_filters(
-        application_name: Optional[str],
-        environment_name: Optional[str],
-        manifest_sync: Optional[bool],
-    ) -> list:
-        conditions = []
-        if application_name:
-            conditions.append(Application.name == application_name)
-        if environment_name:
-            conditions.append(Environment.name == environment_name)
-        if manifest_sync is not None:
-            conditions.append(ApplicationVersion.manifest_sync == manifest_sync)
-        return conditions
-
-    @staticmethod
-    def _latest_only_join(query, conditions: list):
-        latest = (
-            select(
-                ApplicationVersion.application_id,
-                ApplicationVersion.environment_id,
-                func.max(ApplicationVersion.deployed_at).label("max_deployed"),
-            )
-            .join(Application, Application.id == ApplicationVersion.application_id)
-            .join(Environment, Environment.id == ApplicationVersion.environment_id)
-            .where(*conditions)
-            .group_by(
-                ApplicationVersion.application_id,
-                ApplicationVersion.environment_id,
-            )
-            .subquery()
+@pytest.mark.asyncio
+async def test_append_execution_result_calls_repo():
+    """Test appending a result delegates to the repository."""
+    fake_db = object()
+    execution_id = "test-exec-id"
+    payload = ExecutionResultAppend(
+        result=DeploymentResult(
+            Env="qa", Repo="orders", App="payments",
+            Version="1.4.0", Status="SUCCESS",
         )
-        return query.join(
-            latest,
-            and_(
-                ApplicationVersion.application_id == latest.c.application_id,
-                ApplicationVersion.environment_id == latest.c.environment_id,
-                ApplicationVersion.deployed_at == latest.c.max_deployed,
-            ),
+    )
+
+    with patch(
+        "app.routes.execution_state.ExecutionStateRepository.append_result",
+        new_callable=AsyncMock,
+    ) as mock_append:
+        result = await append_execution_result(execution_id, payload, db=fake_db)
+
+    mock_append.assert_awaited_once_with(
+        fake_db, execution_id, payload.result.model_dump(), None
+    )
+    assert result == {"appended": True}
+
+
+@pytest.mark.asyncio
+async def test_append_execution_result_with_blocked():
+    """Test appending a result that also blocks the app."""
+    fake_db = object()
+    execution_id = "test-exec-id"
+    payload = ExecutionResultAppend(
+        result=DeploymentResult(
+            Env="qa", Repo="orders", App="payments",
+            Version="1.4.0", Status="FAILURE",
+        ),
+        blocked=BlockedApp(Env="qa", Repo="orders", App="payments"),
+    )
+
+    with patch(
+        "app.routes.execution_state.ExecutionStateRepository.append_result",
+        new_callable=AsyncMock,
+    ) as mock_append:
+        await append_execution_result(execution_id, payload, db=fake_db)
+
+    mock_append.assert_awaited_once_with(
+        fake_db, execution_id, payload.result.model_dump(), payload.blocked.model_dump()
+    )
+
+
+@pytest.mark.asyncio
+async def test_append_execution_result_not_found_raises():
+    """Test appending to a non-existent execution state raises NotFoundException."""
+    fake_db = object()
+    payload = ExecutionResultAppend(
+        result=DeploymentResult(
+            Env="qa", Repo="orders", App="payments",
+            Version="1.4.0", Status="SUCCESS",
         )
+    )
 
-    @staticmethod
-    async def list_application_versions(
-        db: AsyncSession,
-        skip: int = 0,
-        limit: int = 10,
-        application_name: Optional[str] = None,
-        environment_name: Optional[str] = None,
-        latest_only: bool = False,
-        manifest_sync: Optional[bool] = None,
-        expand: Optional[str] = None,
-    ) -> list[ApplicationVersion]:
-        """List application versions with optional filtering and metadata expansion."""
-        include_metadata = expand == "metadata"
+    with patch(
+        "app.routes.execution_state.ExecutionStateRepository.append_result",
+        new_callable=AsyncMock,
+    ) as mock_append:
+        mock_append.side_effect = NotFoundException(detail="Execution state not found")
 
-        query = (
-            select(ApplicationVersion)
-            .join(Application, Application.id == ApplicationVersion.application_id)
-            .join(Environment, Environment.id == ApplicationVersion.environment_id)
-        )
+        with pytest.raises(NotFoundException) as exc_info:
+            await append_execution_result("missing-id", payload, db=fake_db)
 
-        if include_metadata:
-            query = query.join(
-                RepositoryModel, RepositoryModel.id == Application.repository_id
-            ).add_columns(
-                Application.name.label("application_name"),
-                Environment.name.label("environment_name"),
-                RepositoryModel.name.label("repository_name"),
-            )
-
-        conditions = ApplicationRepository._version_filters(
-            application_name, environment_name, manifest_sync
-        )
-        query = query.where(*conditions)
-
-        if latest_only:
-            query = ApplicationRepository._latest_only_join(query, conditions)
-
-        query = (
-            query.order_by(ApplicationVersion.deployed_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
-
-        result = await db.execute(query)
-
-        if not include_metadata:
-            return list(result.scalars().all())
-
-        versions = []
-        for av, app_name, env_name, repo_name in result.all():
-            av.application_name = app_name
-            av.environment_name = env_name
-            av.repository_name = repo_name
-            versions.append(av)
-        return versions
+    assert "not found" in str(exc_info.value).lower()
