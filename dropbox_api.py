@@ -1,69 +1,104 @@
 @pytest.mark.asyncio
-async def test_append_execution_result_calls_repo():
-    """Test appending a result delegates to the repository."""
-    fake_db = object()
-    execution_id = "test-exec-id"
-    payload = ExecutionResultAppend(
-        result=DeploymentResult(
-            Env="qa", Repo="orders", App="payments",
-            Version="1.4.0", Status="SUCCESS",
-        )
-    )
+async def test_append_execution_result(
+    test_client: AsyncClient, existing_execution_state: dict
+):
+    """Tests appending a single result to an execution state."""
+    execution_id = existing_execution_state["execution_id"]
+    payload = {
+        "result": {
+            "Env": "qa", "Repo": "orders", "App": "payments",
+            "Version": "1.4.0", "Status": "SUCCESS",
+        }
+    }
 
-    with patch(
-        "app.routes.execution_state.ExecutionStateRepository.append_result",
-        new_callable=AsyncMock,
-    ) as mock_append:
-        result = await append_execution_result(execution_id, payload, db=fake_db)
+    response = await test_client.post(f"{BASE}/{execution_id}/results", json=payload)
+    assert response.status_code == 201
 
-    mock_append.assert_awaited_once_with(
-        fake_db, execution_id, payload.result.model_dump(), None
-    )
-    assert result == {"appended": True}
-
-
-@pytest.mark.asyncio
-async def test_append_execution_result_with_blocked():
-    """Test appending a result that also blocks the app."""
-    fake_db = object()
-    execution_id = "test-exec-id"
-    payload = ExecutionResultAppend(
-        result=DeploymentResult(
-            Env="qa", Repo="orders", App="payments",
-            Version="1.4.0", Status="FAILURE",
-        ),
-        blocked=BlockedApp(Env="qa", Repo="orders", App="payments"),
-    )
-
-    with patch(
-        "app.routes.execution_state.ExecutionStateRepository.append_result",
-        new_callable=AsyncMock,
-    ) as mock_append:
-        await append_execution_result(execution_id, payload, db=fake_db)
-
-    mock_append.assert_awaited_once_with(
-        fake_db, execution_id, payload.result.model_dump(), payload.blocked.model_dump()
-    )
+    state = await test_client.get(f"{BASE}/{execution_id}")
+    body = state.json()
+    assert len(body["results"]) == 1
+    assert body["results"][0]["App"] == "payments"
+    assert body["blocked_apps"] == []
 
 
 @pytest.mark.asyncio
-async def test_append_execution_result_not_found_raises():
-    """Test appending to a non-existent execution state raises NotFoundException."""
-    fake_db = object()
-    payload = ExecutionResultAppend(
-        result=DeploymentResult(
-            Env="qa", Repo="orders", App="payments",
-            Version="1.4.0", Status="SUCCESS",
+async def test_append_multiple_results_accumulate(
+    test_client: AsyncClient, existing_execution_state: dict
+):
+    """Tests that successive appends accumulate rather than overwrite."""
+    execution_id = existing_execution_state["execution_id"]
+
+    for app in ("payments", "checkout", "shipping"):
+        payload = {
+            "result": {
+                "Env": "qa", "Repo": "orders", "App": app,
+                "Version": "1.0.0", "Status": "SUCCESS",
+            }
+        }
+        response = await test_client.post(
+            f"{BASE}/{execution_id}/results", json=payload
         )
+        assert response.status_code == 201
+
+    state = await test_client.get(f"{BASE}/{execution_id}")
+    apps = [r["App"] for r in state.json()["results"]]
+    assert apps == ["payments", "checkout", "shipping"]
+
+
+@pytest.mark.asyncio
+async def test_append_execution_result_with_blocked(
+    test_client: AsyncClient, existing_execution_state: dict
+):
+    """Tests appending a failed result also records the blocked app."""
+    execution_id = existing_execution_state["execution_id"]
+    payload = {
+        "result": {
+            "Env": "qa", "Repo": "orders", "App": "payments",
+            "Version": "1.4.0", "Status": "FAILURE",
+        },
+        "blocked": {"Env": "qa", "Repo": "orders", "App": "payments"},
+    }
+
+    response = await test_client.post(f"{BASE}/{execution_id}/results", json=payload)
+    assert response.status_code == 201
+
+    body = (await test_client.get(f"{BASE}/{execution_id}")).json()
+    assert len(body["results"]) == 1
+    assert len(body["blocked_apps"]) == 1
+    assert body["blocked_apps"][0]["App"] == "payments"
+
+
+@pytest.mark.asyncio
+async def test_append_execution_result_not_found(test_client: AsyncClient):
+    """Tests appending to a non-existent execution state returns 404."""
+    payload = {
+        "result": {
+            "Env": "qa", "Repo": "orders", "App": "payments",
+            "Version": "1.4.0", "Status": "SUCCESS",
+        }
+    }
+
+    response = await test_client.post(f"{BASE}/{uuid4()}/results", json=payload)
+    assert response.status_code == 404
+    assert "not found" in extract_message(response.json())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_result",
+    [
+        {"Env": "qa", "Repo": "orders", "App": "payments", "Version": "1.0.0"},
+        {"Env": "qa", "Repo": "orders", "App": "payments", "Status": "SUCCESS"},
+        {},
+    ],
+)
+async def test_append_execution_result_invalid_payload(
+    test_client: AsyncClient, existing_execution_state: dict, bad_result: dict
+):
+    """Tests that incomplete result payloads are rejected."""
+    execution_id = existing_execution_state["execution_id"]
+
+    response = await test_client.post(
+        f"{BASE}/{execution_id}/results", json={"result": bad_result}
     )
-
-    with patch(
-        "app.routes.execution_state.ExecutionStateRepository.append_result",
-        new_callable=AsyncMock,
-    ) as mock_append:
-        mock_append.side_effect = NotFoundException(detail="Execution state not found")
-
-        with pytest.raises(NotFoundException) as exc_info:
-            await append_execution_result("missing-id", payload, db=fake_db)
-
-    assert "not found" in str(exc_info.value).lower()
+    assert response.status_code == 422
