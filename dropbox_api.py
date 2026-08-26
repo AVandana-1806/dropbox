@@ -1,52 +1,43 @@
-    def append_result(
-        self, execution_id: str, result: dict, blocked: Optional[dict] = None
-    ) -> bool:
-        """Atomically append one app's result via the Release API.
-
-        Server does the append inside one UPDATE, so parallel AppMap
-        writers cannot overwrite each other.
-        """
-        url = f"{self.api_url}/execution-states/{execution_id}/results"
-        payload = {"result": result, "blocked": blocked}
-        headers = self._sign_request("POST", url, payload)
-
-        try:
-            resp = httpx.post(
-                url, content=json.dumps(payload), headers=headers, timeout=self.timeout
-            )
-            resp.raise_for_status()
-            return True
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "HTTP %s appending result for %s: %s",
-                e.response.status_code, execution_id, e.response.text,
-            )
-            raise
-
-    def accumulate(self) -> Dict[str, Any]:
-        """Persist one app's result via atomic server-side append."""
-        app = self.event.get("app", {})
-        outcome = self.event.get("outcome", {})
+    def finalize(self) -> Dict[str, Any]:
+        """Build the execution summary shown as the state machine's final output."""
         execution_id = self.event.get("execution_id")
 
-        env = app.get("EnvName")
-        repo = app.get("RepoName")
-        name = app.get("Name")
-        version = app.get("Version")
-        status = outcome.get("status", "UNKNOWN")
+        state = self.release_api.get_execution_state(execution_id)
+        results = state.get("results", [])
+        blocked = state.get("blocked_apps", [])
 
-        result_entry = {
-            "Env": env, "Repo": repo, "App": name,
-            "Version": version, "Status": status,
+        summary = self._tally(results)
+        by_env = self._tally_by_env(results)
+
+        if summary["failure"] or summary["rollback"]:
+            status = "COMPLETED_WITH_FAILURES"
+        else:
+            status = "COMPLETED"
+
+        return {
+            "execution_id": execution_id,
+            "status": status,
+            "summary": summary,
+            "environments": by_env,
+            "blocked_apps": blocked,
         }
 
-        block_entry = None
-        if status in ("FAILURE", "ROLLBACK"):
-            block_entry = {"Env": env, "Repo": repo, "App": name}
-            logger.info("Blocked %s for subsequent environments", name)
+    @staticmethod
+    def _tally(results: list) -> Dict[str, int]:
+        counts = {"total": 0, "success": 0, "failure": 0, "rollback": 0, "skipped": 0}
+        for r in results:
+            counts["total"] += 1
+            key = r["Status"].lower()
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
-        if execution_id:
-            self.release_api.append_result(execution_id, result_entry, block_entry)
-
-        logger.info("Recorded %s/%s/%s - %s", env, repo, name, status)
-        return result_entry
+    @staticmethod
+    def _tally_by_env(results: list) -> Dict[str, Dict[str, int]]:
+        envs: Dict[str, Dict[str, int]] = {}
+        for r in results:
+            env = envs.setdefault(
+                r["Env"], {"success": 0, "failure": 0, "rollback": 0, "skipped": 0}
+            )
+            key = r["Status"].lower()
+            env[key] = env.get(key, 0) + 1
+        return envs
