@@ -1,15 +1,1 @@
-fields @timestamp, @message
-| filter @message like /FLOW_APEX_REQUEST/
-| parse @message "idCount=* " as idCount
-| stats count() as calls, avg(idCount) as avgIds, max(idCount) as maxIds by bin(5m)
-
-
-fields @timestamp, @message
-| filter @message like /Received sink record batch size=|FLOW_APEX_REQUEST|FLOW_CIVICA_SAVE_RESPONSE/
-| sort @timestamp asc
-| limit 500
-
-
-fields @timestamp, @message
-| filter @message like /FLOW_CIVICA_PROVIDER_DELETE_REQUEST/
-| stats count() by bin(1d)
+return_message = {"time": log_event['timestamp'], "subscriptionFilter": filterName,"LogGroup": LogGroupName, "LogStream": LogStream, "event": log_event['message']}
