@@ -27,18 +27,24 @@ import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-for _noisy in ("boto3", "botocore", "urllib3"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
-
-# EMF requires the raw JSON as the entire log line; the default Lambda log
-# format would prefix it and break parsing, so use a bare stdout handler.
 _metrics_logger = logging.getLogger("emf")
-_metrics_handler = logging.StreamHandler(sys.stdout)
-_metrics_handler.setFormatter(logging.Formatter("%(message)s"))
-_metrics_logger.addHandler(_metrics_handler)
-_metrics_logger.setLevel(logging.INFO)
-_metrics_logger.propagate = False
+
+
+def _configure_logging() -> None:
+    logger.setLevel(logging.INFO)
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # EMF requires the raw JSON as the entire log line; the default Lambda log
+    # format would prefix it and break parsing, so use a bare stdout handler.
+    metrics_handler = logging.StreamHandler(sys.stdout)
+    metrics_handler.setFormatter(logging.Formatter("%(message)s"))
+    _metrics_logger.addHandler(metrics_handler)
+    _metrics_logger.setLevel(logging.INFO)
+    _metrics_logger.propagate = False
+
+
+_configure_logging()
 
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "LogPipeline")
 # Off by default: the per-log-group EventsIn/EventsOut metrics exist for the
