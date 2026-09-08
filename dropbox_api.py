@@ -10,9 +10,8 @@ later invocation instead of being lost.
 Event selection happens upstream: only the required log groups have
 subscription filters, so this processor forwards everything it receives.
 
-Environment variables:
-    EMIT_METRICS       "true" to emit per-log-group EMF counters for the
-                       ledger reconciler (default: false)
+Emits Reingested / ProcessingFailed / DeliveredBytes as EMF counters for
+the pipeline alarms.
 """
 
 import base64
@@ -47,10 +46,6 @@ def _configure_logging() -> None:
 _configure_logging()
 
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "LogPipeline")
-# Off by default: the per-log-group EventsIn/EventsOut metrics exist for the
-# ledger reconciler and cost money as custom metrics. Flip on when (if) the
-# ledger components are deployed.
-EMIT_METRICS = os.environ.get("EMIT_METRICS", "false").lower() == "true"
 
 MAX_RESPONSE_BYTES = 5_500_000
 MAX_BATCH_RECORDS = 500
@@ -92,23 +87,17 @@ class CloudWatchBatchTransformer:
                 self._to_hec_event(envelope, event)
                 for event in envelope["logEvents"]
             ]
-            stats = {
-                "log_group": envelope["logGroup"],
-                "events_in": len(envelope["logEvents"]),
-                "events_out": len(events),
-            }
         except (KeyError, TypeError) as exc:
             logger.error("record %s has malformed envelope: %s", record_id, exc)
             return {"recordId": record_id, "result": "ProcessingFailed"}
         if not events:
-            return {"recordId": record_id, "result": "Dropped", "_stats": stats}
+            return {"recordId": record_id, "result": "Dropped"}
 
         payload = "".join(events).encode()
         return {
             "recordId": record_id,
             "result": "Ok",
             "data": base64.b64encode(payload).decode(),
-            "_stats": stats,
         }
 
     @staticmethod
@@ -253,50 +242,17 @@ def _emit_summary(counts: dict) -> None:
     }))
 
 
-def _emit_metrics(stats: dict) -> None:
-    """Publish per-log-group EMF counters for the ledger reconciler."""
-    timestamp = int(time.time() * 1000)
-    for log_group, (events_in, events_out) in stats.items():
-        _metrics_logger.info(json.dumps({
-            "_aws": {
-                "Timestamp": timestamp,
-                "CloudWatchMetrics": [{
-                    "Namespace": METRIC_NAMESPACE,
-                    "Dimensions": [["LogGroup"]],
-                    "Metrics": [
-                        {"Name": "EventsIn", "Unit": "Count"},
-                        {"Name": "EventsOut", "Unit": "Count"},
-                    ],
-                }],
-            },
-            "LogGroup": log_group,
-            "EventsIn": events_in,
-            "EventsOut": events_out,
-        }))
-
-
 def handler(event: dict, context: object) -> dict:
     """Firehose transformation entry point."""
     reingester = Reingester(event)
     results: list[dict] = []
     total = 0
     counts = {"Ok": 0, "Dropped": 0, "ProcessingFailed": 0, "Reingested": 0}
-    group_stats: dict = {}
-
-    def tally(stats: dict) -> None:
-        entry = group_stats.setdefault(stats["log_group"], [0, 0])
-        entry[0] += stats["events_in"]
-        entry[1] += stats["events_out"]
 
     for record in event["records"]:
         outcome = _TRANSFORMER.transform(record)
-        stats = outcome.pop("_stats", None)
 
         if outcome["result"] != "Ok":
-            # Filtered-out batches still entered the pipeline; count them.
-            # Control messages and parse failures carry no stats.
-            if stats:
-                tally(stats)
             counts[outcome["result"]] += 1
             results.append(outcome)
             continue
@@ -319,9 +275,6 @@ def handler(event: dict, context: object) -> dict:
             counts["Reingested"] += 1
             results.append({"recordId": record["recordId"], "result": "Dropped"})
         else:
-            # Only records kept in THIS invocation count toward metrics;
-            # re-ingested ones are counted when they come back around.
-            tally(stats)
             total += size
             counts["Ok"] += 1
             results.append(outcome)
@@ -329,8 +282,6 @@ def handler(event: dict, context: object) -> dict:
     reingester.flush()
     counts["bytes"] = total
     _emit_summary(counts)
-    if EMIT_METRICS:
-        _emit_metrics(group_stats)
     logger.info(
         "records=%d ok=%d dropped=%d failed=%d reingested=%d bytes=%d",
         len(event["records"]),
