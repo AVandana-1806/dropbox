@@ -1,61 +1,70 @@
-Options to Reduce Cold Starts
-1. Lambda SnapStart ⭐ Best Option for This Function
-Your function runs Python 3.12, which is fully supported by SnapStart. This is the easiest win — it takes a snapshot of the initialized execution environment when you publish a new version, so subsequent cold starts resume from the snapshot instead of initializing from scratch.
+#!/bin/sh
+# Start a Kafka Connect worker in distributed mode on ECS Fargate.
+# Derives advertised host, env, group.id and storage topics from ECS task metadata.
 
-How to enable: Go to your function → Configuration → General configuration → Edit → set SnapStart to PublishedVersions, then publish a new version.
-Expected improvement: Sub-second startup, typically 10x faster cold starts.
-Cost: Small additional charge for snapshot caching (~3 hour minimum per snapshot restore).
-Caveat: SnapStart requires you to invoke a published version (not $LATEST). If your Firehose delivery stream is pointing to $LATEST, you'd need to update it to point to the published version ARN.
-Direct link: Enable SnapStart on this function 
+set -eu
 
-2. Provisioned Concurrency
-Pre-warms a fixed number of execution environments so they're always ready. Zero cold starts for those pre-warmed instances.
+PROPS=/app/kafka/config/connect-distributed.properties
 
-How to enable: Go to your function → Configuration → Concurrency → Add provisioned concurrency. Setting it to 2–3 would cover most of the scaling events you're seeing.
-Trade-off: You pay for provisioned concurrency even when the function isn't being invoked. For a Firehose processor that runs continuously, this cost is usually justified.
-Best used with: A published version or alias (not $LATEST).
-Direct link: Configure Provisioned Concurrency 
+require() {
+  if [ -z "$2" ] || [ "$2" = "null" ]; then
+    echo "ERROR: could not resolve $1" >&2
+    exit 1
+  fi
+}
 
-3. Increase Memory Allocation
-Your function currently uses 256 MB with 111 MB max used. Increasing memory also increases CPU allocation, which speeds up the init phase. Going from 256 MB → 512 MB can noticeably reduce cold start duration with minimal cost impact since the function runs fast (~300–500ms).
+set_prop() {
+  if grep -q "^$1=" "$PROPS"; then
+    sed -i "s|^$1=.*|$1=$2|" "$PROPS"
+  else
+    echo "$1=$2" >> "$PROPS"
+  fi
+}
 
-How to enable: Configuration → General configuration → Memory → increase to 512 MB.
-Cost impact: Minimal — billed duration is short, and the per-GB-second rate means doubling memory roughly doubles cost per invocation, but the faster execution partially offsets it.
-4. Optimize the Deployment Package
-Smaller packages load faster during init. If the function has unused dependencies, trimming them reduces the time Lambda spends loading code during a cold start.
+echo "Starting Kafka Connect worker in distributed mode"
 
-Recommendation for Your Case
-Given that this is a Firehose processor (invoked continuously, not sporadically), the 19 cold starts in 24 hours are relatively low. The best bang-for-buck approach is:
+# Container endpoint = this container (IP, name); /task endpoint = task definition (family)
+CONTAINER_META=$(curl -sf "${ECS_CONTAINER_METADATA_URI_V4}")
+TASK_META=$(curl -sf "${ECS_CONTAINER_METADATA_URI_V4}/task")
 
-Enable SnapStart — free to try, minimal code change, biggest cold start reduction.
-If cold starts still matter after SnapStart, add Provisioned Concurrency of 2 to cover burst scaling events.
-The cold starts you're seeing are mostly happening during scale-out bursts (e.g., the 02:00 UTC and 16:00–17:00 UTC high-traffic windows), so Provisioned Concurrency of 2–3 would absorb those without over-provisioning.
+KAFKA_CONTAINER_HOSTNAME=$(echo "$CONTAINER_META" | jq -r '.Networks[0].IPv4Addresses[0]')
+KAFKA_CONTAINER_ENVIRONMENT=$(echo "$CONTAINER_META" | jq -r '.Name' | sed 's/.*-//')
+# e.g. "kafka-connector-cares300" -> used as-is for group.id and topic prefix
+SERVICE_NAME=$(echo "$TASK_META" | jq -r '.Family')
+# Fargate sets AWS_REGION; fall back to the region field of the task ARN
+REGION=${AWS_REGION:-$(echo "$TASK_META" | jq -r '.TaskARN' | cut -d: -f4)}
 
+require KAFKA_CONTAINER_HOSTNAME "$KAFKA_CONTAINER_HOSTNAME"
+require KAFKA_CONTAINER_ENVIRONMENT "$KAFKA_CONTAINER_ENVIRONMENT"
+require SERVICE_NAME "$SERVICE_NAME"
+require REGION "$REGION"
 
-Root Cause: Lambda.InvokeLimitExceeded → Files Land in S3
-The Lambda itself never failed (ProcessingFailed = 0) — but Firehose couldn't even invoke the Lambda on 22 occasions because the Lambda concurrent execution limit was hit. When Firehose can't invoke the processor Lambda after retries, it treats those batches as failed delivery and writes them to S3 as backup. That's exactly what you're seeing in the bucket.
+KAFKA_MSK_CLUSTER_ARN=$(aws kafka list-clusters --region "$REGION" \
+  | jq -r --arg name "cdi-db-infra--msk-cluster--${KAFKA_CONTAINER_ENVIRONMENT}" \
+      '.ClusterInfoList[] | select(.ClusterName == $name) | .ClusterArn')
+require KAFKA_MSK_CLUSTER_ARN "$KAFKA_MSK_CLUSTER_ARN"
 
-What Happened
-Metric	Value
-Lambda.InvokeLimitExceeded errors	22 times
-InternalError	1 time
-Affected window	02:00 – 07:00 UTC today
-S3 Backup Mode	FailedEventsOnly → writes to s3://cdicares-cloudwatch-to-splunk-logs-dev01-us-west-2/failed-events/
-Retry duration on Firehose	30 seconds — after that, batch goes to S3
-The errors were concentrated in the 02:00–07:00 UTC window, which is exactly the same window where you saw the highest reingestion activity and the slowest invocation durations (max 3,701ms at 02:00). The function was scaling hard, hitting the concurrency ceiling, and Firehose couldn't get invocations through.
+KAFKA_MSK_BOOTSTRAP_SERVERS=$(aws kafka get-bootstrap-brokers --region "$REGION" \
+  --cluster-arn "$KAFKA_MSK_CLUSTER_ARN" | jq -r '.BootstrapBrokerString')
+require KAFKA_MSK_BOOTSTRAP_SERVERS "$KAFKA_MSK_BOOTSTRAP_SERVERS"
 
-Why It's Happening
-Your function has no reserved concurrency set, so it competes with every other Lambda in the account against the 1,000 account-wide limit. During burst periods, other functions in the account may be consuming concurrency, leaving none available for this Firehose processor.
+set_prop bootstrap.servers           "$KAFKA_MSK_BOOTSTRAP_SERVERS"
+set_prop rest.advertised.host.name   "$KAFKA_CONTAINER_HOSTNAME"
+set_prop group.id                    "$SERVICE_NAME"
+set_prop config.storage.topic        "${SERVICE_NAME}-configs"
+set_prop offset.storage.topic        "${SERVICE_NAME}-offsets"
+set_prop status.storage.topic        "${SERVICE_NAME}-status"
 
-How to Fix It
-Option 1: Set Reserved Concurrency for This Function (Recommended)
-Reserve a dedicated concurrency slice so Firehose always has capacity to invoke this function, regardless of what other Lambdas are doing.
+echo "=== Kafka Connect Config ==="
+echo "  region:                    ${REGION}"
+echo "  environment:               ${KAFKA_CONTAINER_ENVIRONMENT}"
+echo "  bootstrap.servers:         ${KAFKA_MSK_BOOTSTRAP_SERVERS}"
+echo "  rest.advertised.host.name: ${KAFKA_CONTAINER_HOSTNAME}"
+echo "  group.id:                  ${SERVICE_NAME}"
+echo "  config.storage.topic:      ${SERVICE_NAME}-configs"
+echo "  offset.storage.topic:      ${SERVICE_NAME}-offsets"
+echo "  status.storage.topic:      ${SERVICE_NAME}-status"
+echo "============================"
 
-Based on your traffic (peak ~4,700 records/hour, ~60s buffer interval), you're processing batches roughly every minute. A reservation of 10–20 concurrent executions would be more than sufficient.
-Go to: Configure Concurrency  → Edit → Reserved concurrency → set to 20
-Option 2: Increase the Account Concurrency Limit
-If other functions are legitimately consuming the 1,000 limit, request a quota increase via Service Quotas  for Concurrent executions in us-west-2.
-
-Option 3: Increase Firehose Retry Duration
-Currently set to 30 seconds — very short. Increasing it to 300–600 seconds gives Firehose more time to retry when Lambda is briefly throttled, reducing the chance of fallback to S3. This is a complementary fix, not a standalone one.
-
+# exec gosu "$KAFKA_USER" /app/kafka/bin/connect-distributed.sh "$PROPS"  # if stepping down from root
+exec /app/kafka/bin/connect-distributed.sh "$PROPS"
