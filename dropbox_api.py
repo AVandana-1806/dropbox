@@ -1,3 +1,37 @@
+"""S3 Failed-Event Replay
+=========================
+
+Scheduled recovery Lambda for the CloudWatch-to-Splunk pipeline. Scans the
+Firehose failure prefixes in the backup bucket, oldest objects first, and
+retries each one: Splunk-rejected records are POSTed directly to HEC, while
+transform failures are re-ingested into Firehose to pass through the
+transform again.
+
+Outcomes per object:
+    replayed/    every record was accepted; object moved here (audit trail)
+    quarantine/  a permanent failure was seen (HEC 4xx, or a Firehose error
+                 code meaning the transform itself rejected the record);
+                 object moved here for a human — retrying would loop forever
+    (stays put)  a transient failure; retried on the next scheduled run
+
+Environment variables:
+    BUCKET_NAME               backup bucket (required)
+    HEC_ENDPOINT              https://splunk-host:8088 (required)
+    HEC_SECRET_ARN            Secrets Manager ARN holding the HEC token, as a
+                              plain string or JSON with a "token" key (required)
+    DELIVERY_STREAM_NAME      Firehose stream for re-ingestion (required)
+    SPLUNK_FAILED_PREFIX      default: splunk-failed/
+    PROCESSING_FAILED_PREFIX  default: processing-failed/
+    REPLAYED_PREFIX           default: replayed/
+    QUARANTINE_PREFIX         default: quarantine/
+    PERMANENT_ERROR_CODES     comma-separated Firehose error codes that mean
+                              "the transform rejected this record"; such
+                              records are quarantined, not re-ingested
+                              (default: Lambda.ProcessingFailedStatus)
+    MAX_OBJECTS_PER_RUN       default: 200
+    MIN_AGE_MINUTES           default: 15 (leave room for Firehose's own retries)
+"""
+
 import base64
 import gzip
 import json
@@ -12,9 +46,15 @@ import urllib3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-for _noisy in ("boto3", "botocore", "urllib3"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+def _configure_logging() -> None:
+    logger.setLevel(logging.INFO)
+    for name in ("boto3", "botocore", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+_configure_logging()
 
 GZIP_MAGIC = b"\x1f\x8b"
 HEC_BATCH_BYTES = 512_000
@@ -47,7 +87,8 @@ class ReplayConfig:
     @classmethod
     def from_env(cls) -> "ReplayConfig":
         """Build config from the Lambda environment."""
-        codes = os.environ.get("PERMANENT_ERROR_CODES", "Lambda.ProcessingFailedStatus")
+        codes = os.environ.get("PERMANENT_ERROR_CODES",
+                               "Lambda.ProcessingFailedStatus")
         return cls(
             bucket=os.environ["BUCKET_NAME"],
             splunk_failed_prefix=os.environ.get(
@@ -110,12 +151,10 @@ class FailedObjectStore:
             if not line.strip():
                 continue
             document = json.loads(line)
-            records.append(
-                (
-                    document.get("errorCode", ""),
-                    base64.b64decode(document["rawData"]),
-                )
-            )
+            records.append((
+                document.get("errorCode", ""),
+                base64.b64decode(document["rawData"]),
+            ))
         return records
 
     def move(self, key: str, dest_prefix: str) -> None:
@@ -222,10 +261,15 @@ class FirehoseReingester:
 
 _CONFIG = ReplayConfig.from_env()
 _SESSION = boto3.Session()
+# Built once per container: constructing clients rebuilds botocore metadata
+# and the TLS pool, which is wasted work on every scheduled run.
+S3_CLIENT = _SESSION.client("s3")
+FIREHOSE_CLIENT = _SESSION.client("firehose")
+SECRETS_CLIENT = _SESSION.client("secretsmanager")
 
 
 def _hec_token() -> str:
-    raw = _SESSION.client("secretsmanager").get_secret_value(
+    raw = SECRETS_CLIENT.get_secret_value(
         SecretId=_CONFIG.hec_secret_arn
     )["SecretString"]
     try:
@@ -237,9 +281,8 @@ def _hec_token() -> str:
     return raw.strip()
 
 
-def _replay_object(
-    store: FailedObjectStore, key: str, sender, permanent_codes: frozenset[str]
-) -> str:
+def _replay_object(store: FailedObjectStore, key: str, sender,
+                   permanent_codes: frozenset[str]) -> str:
     """Replay one object; return 'replayed' or 'quarantined'."""
     records = store.read_manifest(key)
     retryable = [data for code, data in records if code not in permanent_codes]
@@ -256,20 +299,15 @@ def _replay_object(
 
 def handler(event: dict, context: object) -> dict:
     """Scheduled entry point: replay aged failed objects, oldest first."""
-    store = FailedObjectStore(_CONFIG, _SESSION.client("s3"))
+    store = FailedObjectStore(_CONFIG, S3_CLIENT)
     plans = (
-        (
-            _CONFIG.splunk_failed_prefix,
-            SplunkHecClient(_CONFIG.hec_endpoint, _hec_token()).send,
-            frozenset(),
-        ),  # Splunk rejects are classified by HEC's response
-        (
-            _CONFIG.processing_failed_prefix,
-            FirehoseReingester(
-                _CONFIG.delivery_stream, _SESSION.client("firehose")
-            ).send,
-            _CONFIG.permanent_error_codes,
-        ),
+        (_CONFIG.splunk_failed_prefix,
+         SplunkHecClient(_CONFIG.hec_endpoint, _hec_token()).send,
+         frozenset()),  # Splunk rejects are classified by HEC's response
+        (_CONFIG.processing_failed_prefix,
+         FirehoseReingester(_CONFIG.delivery_stream,
+                            FIREHOSE_CLIENT).send,
+         _CONFIG.permanent_error_codes),
     )
 
     counts = {"replayed": 0, "quarantined": 0, "failed": 0}
@@ -287,23 +325,13 @@ def handler(event: dict, context: object) -> dict:
                 store.move(key, _CONFIG.quarantine_prefix)
                 counts["quarantined"] += 1
                 logger.error("quarantined %s: %s", key, exc)
-            except (
-                ClientError,
-                RuntimeError,
-                urllib3.exceptions.HTTPError,
-                json.JSONDecodeError,
-                KeyError,
-                OSError,
-            ) as exc:
+            except (ClientError, RuntimeError, urllib3.exceptions.HTTPError,
+                    json.JSONDecodeError, KeyError, OSError) as exc:
                 counts["failed"] += 1
                 logger.error("replay failed for %s (will retry): %s", key, exc)
             budget -= 1
 
-    logger.info(
-        "replayed=%d quarantined=%d failed=%d remaining_budget=%d",
-        counts["replayed"],
-        counts["quarantined"],
-        counts["failed"],
-        budget,
-    )
+    logger.info("replayed=%d quarantined=%d failed=%d remaining_budget=%d",
+                counts["replayed"], counts["quarantined"], counts["failed"],
+                budget)
     return counts
