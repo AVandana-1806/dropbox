@@ -2,34 +2,40 @@
 =========================
 
 Scheduled recovery Lambda for the CloudWatch-to-Splunk pipeline. Scans the
-Firehose failure prefixes in the backup bucket, oldest objects first, and
-retries each one: Splunk-rejected records are POSTed directly to HEC, while
-transform failures are re-ingested into Firehose to pass through the
-transform again.
+Firehose failure prefix in the backup bucket, oldest objects first, and
+retries the records inside.
+
+Routing is per record, by the errorCode Firehose recorded in the manifest,
+not by the object's prefix: Firehose writes both failure types under a single
+prefix unless error_output_prefix keeps the !{firehose:error-output-type}
+variable, and the errorCode is authoritative either way.
+
+    Splunk.*  the record was already transformed and Splunk rejected it
+              -> POST straight to the HEC raw endpoint
+    Lambda.*  the transform errored, was throttled, or never ran
+              -> put back into Firehose to pass through the transform
 
 Outcomes per object:
     replayed/    every record was accepted; object moved here (audit trail)
-    quarantine/  a permanent failure was seen (HEC 4xx, or a Firehose error
-                 code meaning the transform itself rejected the record);
-                 object moved here for a human — retrying would loop forever
+    quarantine/  a permanent failure was seen (HEC 4xx, or an errorCode
+                 meaning the transform rejected the record itself); object
+                 moved here for a human - retrying would loop forever
     (stays put)  a transient failure; retried on the next scheduled run
 
 Environment variables:
-    BUCKET_NAME               backup bucket (required)
-    HEC_ENDPOINT              https://splunk-host:8088 (required)
-    HEC_SECRET_ARN            Secrets Manager ARN holding the HEC token, as a
-                              plain string or JSON with a "token" key (required)
-    DELIVERY_STREAM_NAME      Firehose stream for re-ingestion (required)
-    SPLUNK_FAILED_PREFIX      default: splunk-failed/
-    PROCESSING_FAILED_PREFIX  default: processing-failed/
-    REPLAYED_PREFIX           default: replayed/
-    QUARANTINE_PREFIX         default: quarantine/
-    PERMANENT_ERROR_CODES     comma-separated Firehose error codes that mean
-                              "the transform rejected this record"; such
-                              records are quarantined, not re-ingested
-                              (default: Lambda.ProcessingFailedStatus)
-    MAX_OBJECTS_PER_RUN       default: 200
-    MIN_AGE_MINUTES           default: 15 (leave room for Firehose's own retries)
+    BUCKET_NAME            backup bucket (required)
+    HEC_ENDPOINT           https://splunk-host:8088 (required)
+    HEC_SECRET_ARN         Secrets Manager ARN holding the HEC token, as a
+                           plain string or JSON with a "token" key (required)
+    DELIVERY_STREAM_NAME   Firehose stream for re-ingestion (required)
+    FAILED_PREFIX          default: failed-events/
+    REPLAYED_PREFIX        default: replayed/
+    QUARANTINE_PREFIX      default: quarantine/
+    PERMANENT_ERROR_CODES  comma-separated errorCodes that mean the transform
+                           rejected the record; quarantined, never re-ingested
+                           (default: Lambda.ProcessingFailedStatus)
+    MAX_OBJECTS_PER_RUN    default: 200
+    MIN_AGE_MINUTES        default: 15 (leave room for Firehose's own retries)
 """
 
 import base64
@@ -62,6 +68,7 @@ HEC_RETRY_STATUSES = (408, 429, 500, 502, 503, 504)
 FIREHOSE_BATCH_RECORDS = 500
 FIREHOSE_BATCH_BYTES = 3_500_000
 TIME_GUARD_MS = 30_000
+SPLUNK_ERROR_PREFIX = "Splunk."
 
 
 class PermanentRejection(RuntimeError):
@@ -73,8 +80,7 @@ class ReplayConfig:
     """Runtime configuration read from environment variables."""
 
     bucket: str
-    splunk_failed_prefix: str
-    processing_failed_prefix: str
+    failed_prefix: str
     replayed_prefix: str
     quarantine_prefix: str
     permanent_error_codes: frozenset[str]
@@ -91,12 +97,7 @@ class ReplayConfig:
                                "Lambda.ProcessingFailedStatus")
         return cls(
             bucket=os.environ["BUCKET_NAME"],
-            splunk_failed_prefix=os.environ.get(
-                "SPLUNK_FAILED_PREFIX", "splunk-failed/"
-            ),
-            processing_failed_prefix=os.environ.get(
-                "PROCESSING_FAILED_PREFIX", "processing-failed/"
-            ),
+            failed_prefix=os.environ.get("FAILED_PREFIX", "failed-events/"),
             replayed_prefix=os.environ.get("REPLAYED_PREFIX", "replayed/"),
             quarantine_prefix=os.environ.get("QUARANTINE_PREFIX", "quarantine/"),
             permanent_error_codes=frozenset(
@@ -117,8 +118,8 @@ class FailedObjectStore:
         self._config = config
         self._s3 = s3_client
 
-    def eligible_keys(self, prefix: str, limit: int) -> list[str]:
-        """Return replayable keys under a prefix, oldest first."""
+    def eligible_keys(self, limit: int) -> list[str]:
+        """Return replayable keys under the failure prefix, oldest first."""
         if limit <= 0:
             return []
         cutoff = datetime.now(timezone.utc) - timedelta(
@@ -131,7 +132,7 @@ class FailedObjectStore:
         # eating the runtime before any replaying happens.
         pages = paginator.paginate(
             Bucket=self._config.bucket,
-            Prefix=prefix,
+            Prefix=self._config.failed_prefix,
             PaginationConfig={"MaxItems": max(limit * 20, 1000)},
         )
         for page in pages:
@@ -259,18 +260,57 @@ class FirehoseReingester:
             )
 
 
-_CONFIG = ReplayConfig.from_env()
-_SESSION = boto3.Session()
+class ObjectReplayer:
+    """Replay one failed object, routing each record by its errorCode."""
+
+    def __init__(self, config: ReplayConfig, store: FailedObjectStore,
+                 hec: SplunkHecClient, reingester: FirehoseReingester) -> None:
+        self._config = config
+        self._store = store
+        self._hec = hec
+        self._reingester = reingester
+
+    def replay(self, key: str) -> str:
+        """Replay one object; return 'replayed' or 'quarantined'."""
+        to_splunk: list[bytes] = []
+        to_firehose: list[bytes] = []
+        quarantine = False
+
+        for code, payload in self._store.read_manifest(key):
+            if code in self._config.permanent_error_codes:
+                # The transform rejected this record; re-ingesting it would
+                # fail identically. Keep the object for a human.
+                quarantine = True
+            elif code.startswith(SPLUNK_ERROR_PREFIX):
+                to_splunk.append(payload)
+            else:
+                to_firehose.append(payload)
+
+        if to_splunk:
+            self._hec.send(to_splunk)
+        if to_firehose:
+            self._reingester.send(to_firehose)
+
+        destination = (
+            self._config.quarantine_prefix if quarantine
+            else self._config.replayed_prefix
+        )
+        self._store.move(key, destination)
+        return "quarantined" if quarantine else "replayed"
+
+
+CONFIG = ReplayConfig.from_env()
+SESSION = boto3.Session()
 # Built once per container: constructing clients rebuilds botocore metadata
 # and the TLS pool, which is wasted work on every scheduled run.
-S3_CLIENT = _SESSION.client("s3")
-FIREHOSE_CLIENT = _SESSION.client("firehose")
-SECRETS_CLIENT = _SESSION.client("secretsmanager")
+S3_CLIENT = SESSION.client("s3")
+FIREHOSE_CLIENT = SESSION.client("firehose")
+SECRETS_CLIENT = SESSION.client("secretsmanager")
 
 
 def _hec_token() -> str:
     raw = SECRETS_CLIENT.get_secret_value(
-        SecretId=_CONFIG.hec_secret_arn
+        SecretId=CONFIG.hec_secret_arn
     )["SecretString"]
     try:
         parsed = json.loads(raw)
@@ -281,57 +321,35 @@ def _hec_token() -> str:
     return raw.strip()
 
 
-def _replay_object(store: FailedObjectStore, key: str, sender,
-                   permanent_codes: frozenset[str]) -> str:
-    """Replay one object; return 'replayed' or 'quarantined'."""
-    records = store.read_manifest(key)
-    retryable = [data for code, data in records if code not in permanent_codes]
-    if retryable:
-        sender(retryable)
-    if len(retryable) < len(records):
-        # Some records were rejected by the transform itself; re-ingesting
-        # them would just fail again. Keep the object for a human.
-        store.move(key, _CONFIG.quarantine_prefix)
-        return "quarantined"
-    store.move(key, _CONFIG.replayed_prefix)
-    return "replayed"
-
-
 def handler(event: dict, context: object) -> dict:
     """Scheduled entry point: replay aged failed objects, oldest first."""
-    store = FailedObjectStore(_CONFIG, S3_CLIENT)
-    plans = (
-        (_CONFIG.splunk_failed_prefix,
-         SplunkHecClient(_CONFIG.hec_endpoint, _hec_token()).send,
-         frozenset()),  # Splunk rejects are classified by HEC's response
-        (_CONFIG.processing_failed_prefix,
-         FirehoseReingester(_CONFIG.delivery_stream,
-                            FIREHOSE_CLIENT).send,
-         _CONFIG.permanent_error_codes),
+    store = FailedObjectStore(CONFIG, S3_CLIENT)
+    replayer = ObjectReplayer(
+        CONFIG,
+        store,
+        SplunkHecClient(CONFIG.hec_endpoint, _hec_token()),
+        FirehoseReingester(CONFIG.delivery_stream, FIREHOSE_CLIENT),
     )
 
     counts = {"replayed": 0, "quarantined": 0, "failed": 0}
-    budget = _CONFIG.max_objects
-    for prefix, sender, permanent_codes in plans:
-        for key in store.eligible_keys(prefix, budget):
-            if context.get_remaining_time_in_millis() < TIME_GUARD_MS:
-                logger.warning("time budget low, stopping early at %s", key)
-                budget = 0
-                break
-            try:
-                outcome = _replay_object(store, key, sender, permanent_codes)
-                counts[outcome] += 1
-            except PermanentRejection as exc:
-                store.move(key, _CONFIG.quarantine_prefix)
-                counts["quarantined"] += 1
-                logger.error("quarantined %s: %s", key, exc)
-            except (ClientError, RuntimeError, urllib3.exceptions.HTTPError,
-                    json.JSONDecodeError, KeyError, OSError) as exc:
-                counts["failed"] += 1
-                logger.error("replay failed for %s (will retry): %s", key, exc)
-            budget -= 1
+    remaining_objects = CONFIG.max_objects
+    for key in store.eligible_keys(remaining_objects):
+        if context.get_remaining_time_in_millis() < TIME_GUARD_MS:
+            logger.warning("approaching timeout, stopping before %s", key)
+            break
+        try:
+            counts[replayer.replay(key)] += 1
+        except PermanentRejection as exc:
+            store.move(key, CONFIG.quarantine_prefix)
+            counts["quarantined"] += 1
+            logger.error("quarantined %s: %s", key, exc)
+        except (ClientError, RuntimeError, urllib3.exceptions.HTTPError,
+                ValueError, KeyError, OSError) as exc:
+            counts["failed"] += 1
+            logger.error("replay failed for %s (will retry): %s", key, exc)
+        remaining_objects -= 1
 
-    logger.info("replayed=%d quarantined=%d failed=%d remaining_budget=%d",
+    logger.info("replayed=%d quarantined=%d failed=%d remaining_objects=%d",
                 counts["replayed"], counts["quarantined"], counts["failed"],
-                budget)
+                remaining_objects)
     return counts
