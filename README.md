@@ -1,12 +1,1 @@
-MSK_CLUSTER_NAME="cdi-db-infra--msk-cluster--${KAFKA_CONTAINER_ENVIRONMENT}"
-echo "Looking up MSK cluster ${MSK_CLUSTER_NAME} in ${REGION}"
-
-CLUSTERS=$(aws kafka list-clusters --region "$REGION" --output json)
-KAFKA_MSK_CLUSTER_ARN=$(echo "$CLUSTERS" | jq -r --arg name "$MSK_CLUSTER_NAME" \
-	'.ClusterInfoList[] | select(.ClusterName == $name) | .ClusterArn')
-
-if [ -z "$KAFKA_MSK_CLUSTER_ARN" ]; then
-	echo "ERROR: no MSK cluster named ${MSK_CLUSTER_NAME}. Found:" >&2
-	echo "$CLUSTERS" | jq -r '.ClusterInfoList[].ClusterName' >&2
-	exit 1
-fi
+java.util.concurrent.CompletionException: java.lang.NoClassDefFoundError: Could not initialize class com.snowflake.ingest.streaming.FFIClient\n\tat java.base/java.util.concurrent.CompletableFuture.encodeThrowable(CompletableFuture.java:315)\n\tat java.base/java.util.concurrent.CompletableFuture.completeThrowable(CompletableFuture.java:320)\n\tat java.base/java.util.concurrent.CompletableFuture$AsyncSupply.run(CompletableFuture.java:1770)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)\n\tat java.base/java.lang.Thread.run(Thread.java:1583)\nCaused by: java.lang.NoClassDefFoundError: Could not initialize class com.snowflake.ingest.streaming.FFIClient\n\tat com.snowflake.ingest.streaming.SnowflakeStreamingIngestClientInternal.<init>(SnowflakeStreamingIngestClientInternal.java:88)\n\tat com.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory$Builder.build(SnowflakeStreamingIngestClientFactory.java:124)\n\tat com.snowflake.kafka.connector.internal.streaming.v2.client.StreamingClientFactory$StreamingClientSupplierImpl.get(StreamingClientFactory.java:89)\n\tat com.snowflake.kafka.connector.internal.streaming.v2.client.StreamingClientFactory.createClient(StreamingClientFactory.java:44)\n\tat com.snowflake.kafka.connector.internal.streaming.v2.client.StreamingClientPool$RefCountedClient.lambda$new$0(StreamingClientPool.java:56)\n\tat java.base/java.util.concurrent.CompletableFuture$AsyncSupply.run(CompletableFuture.java:1768)\n\t... 3 more\nCaused by: java.lang.ExceptionInInitializerError: Exception java.lang.RuntimeException: Failed to load JNI library: Failed to load both main and test libraries [in thread \"SNOWFLAKE_CONNECTOR-io-1\"]\n\tat com.snowflake.ingest.streaming.FFIClient.<clinit>(FFIClient.java:59)\n\t... 9 more\n
