@@ -1,41 +1,17 @@
-"""S3 Failed-Event Replay
-=========================
+"""CloudWatch-to-Splunk Firehose Transform
+==========================================
 
-Scheduled recovery Lambda for the CloudWatch-to-Splunk pipeline. Scans the
-Firehose failure prefix in the backup bucket, oldest objects first, and
-retries the records inside.
+Firehose data processor: decompresses CloudWatch Logs batches, flattens
+them, and emits one JSON line per log event for the Splunk HEC raw
+endpoint. Records that would push the response past Firehose's 6 MB
+synchronous-invoke limit are re-ingested into the delivery stream for a
+later invocation instead of being lost.
 
-Routing is per record, by the errorCode Firehose recorded in the manifest,
-not by the object's prefix: Firehose writes both failure types under a single
-prefix unless error_output_prefix keeps the !{firehose:error-output-type}
-variable, and the errorCode is authoritative either way.
+Event selection happens upstream: only the required log groups have
+subscription filters, so this processor forwards everything it receives.
 
-    Splunk.*  the record was already transformed and Splunk rejected it
-              -> POST straight to the HEC raw endpoint
-    Lambda.*  the transform errored, was throttled, or never ran
-              -> put back into Firehose to pass through the transform
-
-Outcomes per object:
-    replayed/    every record was accepted; object moved here (audit trail)
-    quarantine/  a permanent failure was seen (HEC 4xx, or an errorCode
-                 meaning the transform rejected the record itself); object
-                 moved here for a human - retrying would loop forever
-    (stays put)  a transient failure; retried on the next scheduled run
-
-Environment variables:
-    BUCKET_NAME            backup bucket (required)
-    HEC_ENDPOINT           https://splunk-host:8088 (required)
-    HEC_SECRET_ARN         Secrets Manager ARN holding the HEC token, as a
-                           plain string or JSON with a "token" key (required)
-    DELIVERY_STREAM_NAME   Firehose stream for re-ingestion (required)
-    FAILED_PREFIX          default: failed-events/
-    REPLAYED_PREFIX        default: replayed/
-    QUARANTINE_PREFIX      default: quarantine/
-    PERMANENT_ERROR_CODES  comma-separated errorCodes that mean the transform
-                           rejected the record; quarantined, never re-ingested
-                           (default: Lambda.ProcessingFailedStatus)
-    MAX_OBJECTS_PER_RUN    default: 200
-    MIN_AGE_MINUTES        default: 15 (leave room for Firehose's own retries)
+Emits Reingested / ProcessingFailed / DeliveredBytes as EMF counters for
+the pipeline alarms.
 """
 
 import base64
@@ -43,15 +19,14 @@ import gzip
 import json
 import logging
 import os
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import sys
+import time
 
 import boto3
-import urllib3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
+_metrics_logger = logging.getLogger("emf")
 
 
 def _configure_logging() -> None:
@@ -59,187 +34,207 @@ def _configure_logging() -> None:
     for name in ("boto3", "botocore", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    if _metrics_logger.handlers:
+        return
+
+    # EMF requires the raw JSON as the entire log line; the default Lambda log
+    # format would prefix it and break parsing, so use a bare stdout handler.
+    metrics_handler = logging.StreamHandler(sys.stdout)
+    metrics_handler.setFormatter(logging.Formatter("%(message)s"))
+    _metrics_logger.addHandler(metrics_handler)
+    _metrics_logger.setLevel(logging.INFO)
+    _metrics_logger.propagate = False
+
 
 _configure_logging()
 
-GZIP_MAGIC = b"\x1f\x8b"
-HEC_BATCH_BYTES = 512_000
-HEC_RETRY_STATUSES = (408, 429, 500, 502, 503, 504)
-FIREHOSE_BATCH_RECORDS = 500
-FIREHOSE_BATCH_BYTES = 3_500_000
-TIME_GUARD_MS = 30_000
-SPLUNK_ERROR_PREFIX = "Splunk."
+METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "LogPipeline")
+
+MAX_RESPONSE_BYTES = 5_500_000
+MAX_BATCH_RECORDS = 500
+MAX_BATCH_BYTES = 3_500_000
+PUT_BATCH_ATTEMPTS = 3
+PUT_BATCH_BACKOFF_SECONDS = 0.2
+
+# Firehose rejects any single record over 1,000 KiB. Chunk well under it:
+# the budget is measured on uncompressed message bytes, and gzip only ever
+# shrinks log text, so a 700 KB chunk is comfortably inside the limit.
+FIREHOSE_MAX_RECORD_BYTES = 1_024_000
+REINGEST_CHUNK_BYTES = 700_000
+# Measured: a zero-length event serializes to ~110 bytes of envelope JSON
+# (56-char id, 13-digit timestamp, keys and punctuation). Rounded up, since
+# underestimating here would let a chunk exceed the record limit and force an
+# otherwise splittable record to S3.
+EVENT_OVERHEAD_BYTES = 128
+
+# A chunk must also stay small enough that re-processing it fits the response
+# budget, or it would be split into itself and re-ingested forever. Every HEC
+# line repeats the log group, stream and filter names, so a batch of many tiny
+# events inflates several times over; budget on the transformed size, allowing
+# for base64's 4/3 expansion on top.
+HEC_LINE_OVERHEAD_BYTES = 96
+TRANSFORMED_CHUNK_BYTES = 3_000_000
+
+# Built once per container, not per invocation: constructing a client rebuilds
+# botocore's metadata and TLS pool, which is wasted work at ~100k invokes/day.
+FIREHOSE_CLIENT = boto3.client("firehose")
 
 
-class PermanentRejection(RuntimeError):
-    """The destination rejected the data itself; retrying cannot succeed."""
+class CloudWatchBatchTransformer:
+    """Decompress and reshape CloudWatch batches into Splunk HEC raw lines."""
 
+    def transform(self, record: dict) -> dict:
+        """Turn one Firehose record into a Firehose transformation result."""
+        record_id = record.get("recordId", "")
+        try:
+            envelope = json.loads(gzip.decompress(base64.b64decode(record["data"])))
+        except (KeyError, OSError, ValueError) as exc:
+            logger.error("record %s unparseable: %s", record_id, exc)
+            return {"recordId": record_id, "result": "ProcessingFailed"}
 
-@dataclass
-class ReplayConfig:
-    """Runtime configuration read from environment variables."""
+        # Valid JSON that is not an object (a bare list or string) would blow up
+        # on the attribute access below; contain it to this record.
+        if not isinstance(envelope, dict):
+            logger.error(
+                "record %s is not a CloudWatch envelope: %s",
+                record_id,
+                type(envelope).__name__,
+            )
+            return {"recordId": record_id, "result": "ProcessingFailed"}
 
-    bucket: str
-    failed_prefix: str
-    replayed_prefix: str
-    quarantine_prefix: str
-    permanent_error_codes: frozenset[str]
-    hec_endpoint: str
-    hec_secret_arn: str
-    delivery_stream: str
-    max_objects: int
-    min_age_minutes: int
+        if envelope.get("messageType") != "DATA_MESSAGE":
+            return {"recordId": record_id, "result": "Dropped"}
 
-    @classmethod
-    def from_env(cls) -> "ReplayConfig":
-        """Build config from the Lambda environment."""
-        codes = os.environ.get("PERMANENT_ERROR_CODES",
-                               "Lambda.ProcessingFailedStatus")
-        return cls(
-            bucket=os.environ["BUCKET_NAME"],
-            failed_prefix=os.environ.get("FAILED_PREFIX", "failed-events/"),
-            replayed_prefix=os.environ.get("REPLAYED_PREFIX", "replayed/"),
-            quarantine_prefix=os.environ.get("QUARANTINE_PREFIX", "quarantine/"),
-            permanent_error_codes=frozenset(
-                code.strip() for code in codes.split(",") if code.strip()
-            ),
-            hec_endpoint=os.environ["HEC_ENDPOINT"].rstrip("/"),
-            hec_secret_arn=os.environ["HEC_SECRET_ARN"],
-            delivery_stream=os.environ["DELIVERY_STREAM_NAME"],
-            max_objects=int(os.environ.get("MAX_OBJECTS_PER_RUN", "200")),
-            min_age_minutes=int(os.environ.get("MIN_AGE_MINUTES", "15")),
-        )
+        try:
+            events = [
+                self._to_hec_event(envelope, event)
+                for event in envelope["logEvents"]
+            ]
+        except (KeyError, TypeError) as exc:
+            logger.error("record %s has malformed envelope: %s", record_id, exc)
+            return {"recordId": record_id, "result": "ProcessingFailed"}
+        if not events:
+            return {"recordId": record_id, "result": "Dropped"}
 
-
-class FailedObjectStore:
-    """List, read, and relocate failed-event objects in the backup bucket."""
-
-    def __init__(self, config: ReplayConfig, s3_client) -> None:
-        self._config = config
-        self._s3 = s3_client
-
-    def eligible_keys(self, limit: int) -> list[str]:
-        """Return replayable keys under the failure prefix, oldest first."""
-        if limit <= 0:
-            return []
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            minutes=self._config.min_age_minutes
-        )
-        stamped = []
-        paginator = self._s3.get_paginator("list_objects_v2")
-        # Firehose keys are date-prefixed, so listing order is roughly
-        # chronological; capping the listing keeps a huge backlog from
-        # eating the runtime before any replaying happens.
-        pages = paginator.paginate(
-            Bucket=self._config.bucket,
-            Prefix=self._config.failed_prefix,
-            PaginationConfig={"MaxItems": max(limit * 20, 1000)},
-        )
-        for page in pages:
-            for obj in page.get("Contents", []):
-                if obj["LastModified"] <= cutoff:
-                    stamped.append((obj["LastModified"], obj["Key"]))
-        stamped.sort()
-        return [key for _, key in stamped[:limit]]
-
-    def read_manifest(self, key: str) -> list[tuple[str, bytes]]:
-        """Return (error_code, raw_payload) per line of a Firehose error manifest."""
-        body = self._s3.get_object(Bucket=self._config.bucket, Key=key)["Body"].read()
-        if body[:2] == GZIP_MAGIC:
-            body = gzip.decompress(body)
-        records = []
-        for line in body.splitlines():
-            if not line.strip():
-                continue
-            document = json.loads(line)
-            records.append((
-                document.get("errorCode", ""),
-                base64.b64decode(document["rawData"]),
-            ))
-        return records
-
-    def move(self, key: str, dest_prefix: str) -> None:
-        """Relocate an object under another prefix (copy first, then delete)."""
-        self._s3.copy_object(
-            Bucket=self._config.bucket,
-            CopySource={"Bucket": self._config.bucket, "Key": key},
-            Key=f"{dest_prefix}{key}",
-        )
-        self._s3.delete_object(Bucket=self._config.bucket, Key=key)
-
-
-class SplunkHecClient:
-    """Post already-transformed HEC event payloads directly to Splunk."""
-
-    def __init__(self, endpoint: str, token: str) -> None:
-        # Must match Firehose's hec_endpoint_type (Raw): each JSON line is a
-        # whole event. The /event endpoint would treat the keys as HEC metadata.
-        self._url = f"{endpoint}/services/collector/raw"
-        self._http = urllib3.PoolManager(
-            timeout=urllib3.Timeout(connect=5.0, read=30.0),
-            retries=urllib3.Retry(
-                total=3,
-                backoff_factor=1.0,
-                allowed_methods={"POST"},  # POST is not retried by default
-                status_forcelist=HEC_RETRY_STATUSES,
-                respect_retry_after_header=True,
-                raise_on_status=False,  # let _post classify the final status
-            ),
-        )
-        self._headers = {
-            "Authorization": f"Splunk {token}",
-            # Required when the token has indexer acknowledgment enabled.
-            "X-Splunk-Request-Channel": str(uuid.uuid4()),
+        payload = "".join(events).encode()
+        return {
+            "recordId": record_id,
+            "result": "Ok",
+            "data": base64.b64encode(payload).decode(),
         }
 
-    def send(self, payloads: list[bytes]) -> None:
-        """Send payloads in size-bounded batches; raise on any rejection."""
-        batch: list[bytes] = []
-        size = 0
-        for payload in payloads:
-            if batch and size + len(payload) > HEC_BATCH_BYTES:
-                self._post(b"".join(batch))
-                batch, size = [], 0
-            batch.append(payload)
-            size += len(payload)
-        if batch:
-            self._post(b"".join(batch))
+    @staticmethod
+    def split(record: dict) -> list[bytes]:
+        """Chunk an oversized batch into smaller re-ingestable gzipped envelopes."""
+        envelope = json.loads(gzip.decompress(base64.b64decode(record["data"])))
+        events = envelope["logEvents"]
+        if len(events) < 2:
+            return []
 
-    def _post(self, body: bytes) -> None:
-        response = self._http.request(
-            "POST", self._url, body=body, headers=self._headers
+        groups = CloudWatchBatchTransformer._group(envelope, events)
+        if len(groups) == 1:
+            # One group means no progress: the chunk would be the input, so it
+            # would come back oversized and split into itself forever. Halve by
+            # count instead - each pass halves again until the pieces fit.
+            middle = len(events) // 2
+            groups = [events[:middle], events[middle:]]
+
+        chunks = [
+            CloudWatchBatchTransformer._envelope(envelope, group) for group in groups
+        ]
+        if any(len(chunk) > FIREHOSE_MAX_RECORD_BYTES for chunk in chunks):
+            # An event is too large to re-ingest even alone; the caller marks
+            # the record ProcessingFailed so Firehose preserves it in S3 rather
+            # than looping on a batch Firehose will always reject.
+            logger.error(
+                "record %s has an event too large to re-ingest", record["recordId"]
+            )
+            return []
+        return chunks
+
+    @staticmethod
+    def _group(envelope: dict, events: list[dict]) -> list[list[dict]]:
+        # Two budgets, whichever binds first: raw envelope bytes keep the
+        # gzipped record under Firehose's per-record limit, transformed bytes
+        # keep the re-processed result under the response limit. Sizes are
+        # measured on encoded bytes - non-ASCII logs are multi-byte.
+        hec_overhead = (
+            HEC_LINE_OVERHEAD_BYTES
+            + len(str(envelope.get("logGroup", "")).encode())
+            + len(str(envelope.get("logStream", "")).encode())
+            + len(",".join(envelope.get("subscriptionFilters", [])).encode())
         )
-        summary = f"HEC returned {response.status}: {response.data[:200]!r}"
-        if response.status == 200:
-            try:
-                code = json.loads(response.data).get("code", 0)
-            except (ValueError, AttributeError):
-                code = 0
-            if code == 0:
-                return
-            # 200 with a non-zero code is HEC saying the data itself is bad.
-            raise PermanentRejection(summary)
-        # 4xx (other than the retryable ones) means Splunk rejected the data
-        # or the token itself; sending the same bytes again cannot succeed.
-        if 400 <= response.status < 500 and response.status not in HEC_RETRY_STATUSES:
-            raise PermanentRejection(summary)
-        raise RuntimeError(summary)
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        raw = transformed = 0
+        for event in events:
+            message = len(str(event.get("message", "")).encode())
+            event_raw = message + EVENT_OVERHEAD_BYTES
+            event_transformed = message + hec_overhead
+            over_raw = raw + event_raw > REINGEST_CHUNK_BYTES
+            over_transformed = (
+                transformed + event_transformed > TRANSFORMED_CHUNK_BYTES
+            )
+            if current and (over_raw or over_transformed):
+                groups.append(current)
+                current, raw, transformed = [], 0, 0
+            current.append(event)
+            raw += event_raw
+            transformed += event_transformed
+        if current:
+            groups.append(current)
+        return groups
+
+    @staticmethod
+    def _envelope(envelope: dict, events: list[dict]) -> bytes:
+        return gzip.compress(json.dumps({**envelope, "logEvents": events}).encode())
+
+    @staticmethod
+    def _to_hec_event(envelope: dict, event: dict) -> str:
+        # Firehose delivers to HEC's /raw endpoint, so this whole object is
+        # the Splunk event and every key is search-time extractable (JSON
+        # sourcetype). The shape matches the previous pipeline exactly so
+        # existing props.conf / searches keep working. time stays in
+        # CloudWatch milliseconds; Splunk parses it via TIME_PREFIX/TIME_FORMAT.
+        return (
+            json.dumps(
+                {
+                    "time": event["timestamp"],
+                    "subscriptionFilter": ",".join(
+                        envelope.get("subscriptionFilters", [])
+                    ),
+                    "LogGroup": envelope["logGroup"],
+                    "LogStream": envelope["logStream"],
+                    "event": event["message"],
+                }
+            )
+            + "\n"
+        )
 
 
-class FirehoseReingester:
-    """Re-ingest raw CloudWatch envelopes into the delivery stream."""
+class Reingester:
+    """Re-queue records that could not fit in this invocation's response."""
 
-    def __init__(self, stream: str, firehose_client) -> None:
-        self._stream = stream
-        self._firehose = firehose_client
+    # Direct PUT topology only: records go back into the delivery stream
+    # itself. If a Kinesis Data Stream is ever put in front of Firehose,
+    # this must switch to kinesis:PutRecords on event["sourceKinesisStreamArn"]
+    # instead — a KDS-sourced Firehose rejects PutRecordBatch.
+    def __init__(self, event: dict) -> None:
+        self._firehose = FIREHOSE_CLIENT
+        self._stream = event["deliveryStreamArn"].split("/")[-1]
+        self._payloads: list[bytes] = []
 
-    def send(self, payloads: list[bytes]) -> None:
-        """Put payloads back into Firehose in count- and size-bounded batches."""
+    def add(self, payload: bytes) -> None:
+        """Queue one gzipped envelope for re-ingestion."""
+        self._payloads.append(payload)
+
+    def flush(self) -> None:
+        """Send queued payloads in size- and count-bounded batches."""
         batch: list[bytes] = []
         size = 0
-        for payload in payloads:
-            over_count = len(batch) == FIREHOSE_BATCH_RECORDS
-            over_size = size + len(payload) > FIREHOSE_BATCH_BYTES
+        for payload in self._payloads:
+            over_count = len(batch) == MAX_BATCH_RECORDS
+            over_size = size + len(payload) > MAX_BATCH_BYTES
             if batch and (over_count or over_size):
                 self._put_batch(batch)
                 batch, size = [], 0
@@ -247,109 +242,127 @@ class FirehoseReingester:
             size += len(payload)
         if batch:
             self._put_batch(batch)
-
-    def _put_batch(self, batch: list[bytes]) -> None:
-        response = self._firehose.put_record_batch(
-            DeliveryStreamName=self._stream,
-            Records=[{"Data": payload} for payload in batch],
-        )
-        failed = response.get("FailedPutCount", 0)
-        if failed:
-            raise RuntimeError(
-                f"{failed}/{len(batch)} records rejected by {self._stream}"
+        if self._payloads:
+            logger.info(
+                "re-ingested %d records to %s",
+                len(self._payloads),
+                self._stream,
             )
 
-
-class ObjectReplayer:
-    """Replay one failed object, routing each record by its errorCode."""
-
-    def __init__(self, config: ReplayConfig, store: FailedObjectStore,
-                 hec: SplunkHecClient, reingester: FirehoseReingester) -> None:
-        self._config = config
-        self._store = store
-        self._hec = hec
-        self._reingester = reingester
-
-    def replay(self, key: str) -> str:
-        """Replay one object; return 'replayed' or 'quarantined'."""
-        to_splunk: list[bytes] = []
-        to_firehose: list[bytes] = []
-        quarantine = False
-
-        for code, payload in self._store.read_manifest(key):
-            if code in self._config.permanent_error_codes:
-                # The transform rejected this record; re-ingesting it would
-                # fail identically. Keep the object for a human.
-                quarantine = True
-            elif code.startswith(SPLUNK_ERROR_PREFIX):
-                to_splunk.append(payload)
-            else:
-                to_firehose.append(payload)
-
-        if to_splunk:
-            self._hec.send(to_splunk)
-        if to_firehose:
-            self._reingester.send(to_firehose)
-
-        destination = (
-            self._config.quarantine_prefix if quarantine
-            else self._config.replayed_prefix
+    def _put_batch(self, batch: list[bytes]) -> None:
+        # PutRecordBatch can partially succeed. Re-sending the whole batch
+        # would duplicate the records that were accepted, so retry only the
+        # ones Firehose named in RequestResponses.
+        pending = batch
+        for attempt in range(PUT_BATCH_ATTEMPTS):
+            if attempt:
+                time.sleep(PUT_BATCH_BACKOFF_SECONDS * attempt)
+            try:
+                response = self._firehose.put_record_batch(
+                    DeliveryStreamName=self._stream,
+                    Records=[{"Data": payload} for payload in pending],
+                )
+            except ClientError as exc:
+                raise RuntimeError(f"re-ingestion to {self._stream} failed") from exc
+            if not response.get("FailedPutCount", 0):
+                return
+            responses = response.get("RequestResponses", [])
+            rejected = [
+                payload
+                for payload, result in zip(pending, responses)
+                if result.get("ErrorCode")
+            ]
+            # A short, missing or inconsistent RequestResponses list gives no
+            # way to tell which records landed. Retrying all of them may
+            # duplicate; dropping any of them loses data.
+            if len(responses) != len(pending) or not rejected:
+                rejected = pending
+            pending = rejected
+            logger.warning(
+                "%d/%d re-ingested records rejected by %s, retrying",
+                len(pending),
+                len(batch),
+                self._stream,
+            )
+        raise RuntimeError(
+            f"{len(pending)}/{len(batch)} re-ingested records still rejected "
+            f"by {self._stream} after {PUT_BATCH_ATTEMPTS} attempts"
         )
-        self._store.move(key, destination)
-        return "quarantined" if quarantine else "replayed"
 
 
-CONFIG = ReplayConfig.from_env()
-SESSION = boto3.Session()
-# Built once per container: constructing clients rebuilds botocore metadata
-# and the TLS pool, which is wasted work on every scheduled run.
-S3_CLIENT = SESSION.client("s3")
-FIREHOSE_CLIENT = SESSION.client("firehose")
-SECRETS_CLIENT = SESSION.client("secretsmanager")
+_TRANSFORMER = CloudWatchBatchTransformer()
 
 
-def _hec_token() -> str:
-    raw = SECRETS_CLIENT.get_secret_value(
-        SecretId=CONFIG.hec_secret_arn
-    )["SecretString"]
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return raw.strip()
-    if isinstance(parsed, dict):
-        return str(parsed.get("token") or parsed.get("hec_token") or raw).strip()
-    return raw.strip()
+def _emit_summary(counts: dict) -> None:
+    """Publish invocation-level EMF counters (always on; no dimensions)."""
+    _metrics_logger.info(json.dumps({
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": METRIC_NAMESPACE,
+                "Dimensions": [[]],
+                "Metrics": [
+                    {"Name": "Reingested", "Unit": "Count"},
+                    {"Name": "ProcessingFailed", "Unit": "Count"},
+                    {"Name": "Dropped", "Unit": "Count"},
+                    {"Name": "DeliveredBytes", "Unit": "Bytes"},
+                ],
+            }],
+        },
+        "Reingested": counts["Reingested"],
+        "ProcessingFailed": counts["ProcessingFailed"],
+        "Dropped": counts["Dropped"],
+        "DeliveredBytes": counts["bytes"],
+    }))
 
 
 def handler(event: dict, context: object) -> dict:
-    """Scheduled entry point: replay aged failed objects, oldest first."""
-    store = FailedObjectStore(CONFIG, S3_CLIENT)
-    replayer = ObjectReplayer(
-        CONFIG,
-        store,
-        SplunkHecClient(CONFIG.hec_endpoint, _hec_token()),
-        FirehoseReingester(CONFIG.delivery_stream, FIREHOSE_CLIENT),
+    """Firehose transformation entry point."""
+    reingester = Reingester(event)
+    results: list[dict] = []
+    total = 0
+    counts = {"Ok": 0, "Dropped": 0, "ProcessingFailed": 0, "Reingested": 0}
+
+    for record in event["records"]:
+        outcome = _TRANSFORMER.transform(record)
+
+        if outcome["result"] != "Ok":
+            counts[outcome["result"]] += 1
+            results.append(outcome)
+            continue
+
+        size = len(outcome["data"]) + len(outcome["recordId"]) + 64
+        if size > MAX_RESPONSE_BYTES:
+            chunks = _TRANSFORMER.split(record)
+            if not chunks:
+                counts["ProcessingFailed"] += 1
+                results.append(
+                    {"recordId": record["recordId"], "result": "ProcessingFailed"}
+                )
+                continue
+            for chunk in chunks:
+                reingester.add(chunk)
+            counts["Reingested"] += 1
+            results.append({"recordId": record["recordId"], "result": "Dropped"})
+        elif total + size > MAX_RESPONSE_BYTES:
+            reingester.add(base64.b64decode(record["data"]))
+            counts["Reingested"] += 1
+            results.append({"recordId": record["recordId"], "result": "Dropped"})
+        else:
+            total += size
+            counts["Ok"] += 1
+            results.append(outcome)
+
+    reingester.flush()
+    counts["bytes"] = total
+    _emit_summary(counts)
+    logger.info(
+        "records=%d ok=%d dropped=%d failed=%d reingested=%d bytes=%d",
+        len(event["records"]),
+        counts["Ok"],
+        counts["Dropped"],
+        counts["ProcessingFailed"],
+        counts["Reingested"],
+        total,
     )
-
-    counts = {"replayed": 0, "quarantined": 0, "failed": 0}
-    remaining_objects = CONFIG.max_objects
-    for key in store.eligible_keys(remaining_objects):
-        if context.get_remaining_time_in_millis() < TIME_GUARD_MS:
-            logger.warning("approaching timeout, stopping before %s", key)
-            break
-        try:
-            counts[replayer.replay(key)] += 1
-        except PermanentRejection as exc:
-            store.move(key, CONFIG.quarantine_prefix)
-            counts["quarantined"] += 1
-            logger.error("quarantined %s: %s", key, exc)
-        except (ClientError, RuntimeError, urllib3.exceptions.HTTPError,
-                ValueError, KeyError, OSError) as exc:
-            counts["failed"] += 1
-            logger.error("replay failed for %s (will retry): %s", key, exc)
-        remaining_objects -= 1
-
-    logger.info("replayed=%d quarantined=%d failed=%d remaining_objects=%d",
-                counts["replayed"], counts["quarantined"], counts["failed"],
-                remaining_objects)
-    return counts
+    return {"records": results}
