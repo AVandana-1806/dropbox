@@ -129,18 +129,23 @@ def load_files(client: httpx.Client, bucket: str, file_key: str, flow: str) -> i
     return 0
 
 
-def start_job(client: httpx.Client, flow: str) -> int:
-    """Trigger the flow's start API START_TRIGGERS times and return the failure count."""
-    prefix, _ = FLOWS[flow]
+def trigger(client: httpx.Client, label: str, path: str, payload) -> int:
+    """POST to path START_TRIGGERS times with START_API_WAIT between calls and return the failure count."""
     for i in range(1, START_TRIGGERS + 1):
-        LOGGER.info("[%s] [%d/%d] Triggering start", flow, i, START_TRIGGERS)
-        if not _call(client, "POST", f"{prefix}/start", {"threads": THREADS}):
+        LOGGER.info("[%s] [%d/%d] Triggering %s", label, i, START_TRIGGERS, path)
+        if not _call(client, "POST", path, payload):
             return 1
         if i < START_TRIGGERS:
-            LOGGER.info("[%s] Waiting %ds", flow, START_API_WAIT)
+            LOGGER.info("[%s] Waiting %ds", label, START_API_WAIT)
             time.sleep(START_API_WAIT)
-    LOGGER.info("[%s] Start done", flow)
+    LOGGER.info("[%s] Trigger done", label)
     return 0
+
+
+def start_job(client: httpx.Client, flow: str) -> int:
+    """Trigger the flow's start API and return the failure count."""
+    prefix, _ = FLOWS[flow]
+    return trigger(client, flow, f"{prefix}/start", {"threads": THREADS})
 
 
 def check_status(client: httpx.Client, bucket: str, file_key: str, flow: str) -> int:
@@ -188,7 +193,7 @@ ACTIONS = {
     "LOAD_DATA": lambda client, args: load_files(client, args.bucket, args.file, "ingestion"),
     "START_MIGRATION": lambda client, args: start_job(client, "ingestion"),
     "MIGRATION_STATUS": lambda client, args: check_status(client, args.bucket, args.file, "ingestion"),
-    "DELETE_START": lambda client, args: call_once(client, "POST", DELETE_START_PATH),
+    "DELETE_START": lambda client, args: trigger(client, "delete", DELETE_START_PATH, None),
     "DELETE_COUNT": lambda client, args: call_once(client, "GET", DELETE_COUNT_PATH),
     "DELETE_STATUS": lambda client, args: call_once(client, "GET", DELETE_STATUS_PATH),
 }
