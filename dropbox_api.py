@@ -27,6 +27,9 @@ FLOWS = {
     "ingestion": ("/migration", "docuedge-migration/ingestion_processed_files.txt"),
 }
 STATUS_FIELDS = ("total_documents", "success_count", "failure_count", "processing_count")
+DELETE_START_PATH = "/delete/start"
+DELETE_COUNT_PATH = "/delete/count"
+DELETE_STATUS_PATH = "/delete/status"
 BATCH_SIZE = 10
 BATCH_WAIT = 2
 STATUS_DELAY = 2
@@ -75,6 +78,8 @@ def _call(client, method, path, payload):
         return res
     except httpx.HTTPStatusError as exc:
         LOGGER.error("%s %s -> %s %s", method, path, exc.response.status_code, exc.response.text)
+        if exc.response.status_code == 401:
+            raise
     except httpx.RequestError as exc:
         LOGGER.error("%s %s failed: %s", method, path, exc)
     return None
@@ -92,8 +97,9 @@ def _read_processed(bucket, tracker_key):
 
 
 def load_files(client: httpx.Client, bucket: str, file_key: str, flow: str) -> int:
-    """Send unprocessed files to the flow's load API in chunks of BATCH_SIZE and return the failure count."""
+    """Send unprocessed files to the flow's load API in chunks, recording failed files to S3."""
     prefix, tracker_key = FLOWS[flow]
+    failed_key = f"docuedge-migration/{flow}_failed_files_{int(time.time())}.txt"
     processed = _read_processed(bucket, tracker_key)
     all_files = _read_keys(bucket, file_key)
     remaining = [key for key in all_files if key not in processed]
@@ -103,7 +109,7 @@ def load_files(client: httpx.Client, bucket: str, file_key: str, flow: str) -> i
         flow, len(all_files), len(processed), len(remaining), len(chunks),
     )
 
-    failures = 0
+    failed = []
     for i, chunk in enumerate(chunks, 1):
         LOGGER.info("[%s] [%d/%d] Loading %d files: %s", flow, i, len(chunks), len(chunk), chunk)
         if _call(client, "POST", f"{prefix}/load", {"Key": chunk}):
@@ -111,12 +117,16 @@ def load_files(client: httpx.Client, bucket: str, file_key: str, flow: str) -> i
             S3.put_object(Bucket=bucket, Key=tracker_key, Body="\n".join(sorted(processed)).encode())
             LOGGER.info("[%s] Tracker saved (%d processed)", flow, len(processed))
         else:
-            failures += 1
+            failed.extend(chunk)
+            S3.put_object(Bucket=bucket, Key=failed_key, Body="\n".join(failed).encode())
+            LOGGER.warning("[%s] Chunk failed, %d files recorded in s3://%s/%s", flow, len(failed), bucket, failed_key)
         if i < len(chunks):
             time.sleep(BATCH_WAIT)
 
-    LOGGER.info("[%s] Load done: %d chunks ok, %d failed", flow, len(chunks) - failures, failures)
-    return failures
+    LOGGER.info("[%s] Load done: %d files loaded, %d failed", flow, len(remaining) - len(failed), len(failed))
+    if failed:
+        LOGGER.warning("[%s] Failed files list: s3://%s/%s", flow, bucket, failed_key)
+    return 0
 
 
 def start_job(client: httpx.Client, flow: str) -> int:
@@ -165,6 +175,12 @@ def check_status(client: httpx.Client, bucket: str, file_key: str, flow: str) ->
     return failures
 
 
+def call_once(client: httpx.Client, method: str, path: str) -> int:
+    """Make a single no-body call, log the response and return 0 on success."""
+    LOGGER.info("[delete] %s %s", method, path)
+    return 0 if _call(client, method, path, None) else 1
+
+
 ACTIONS = {
     "LOAD_LINKING": lambda client, args: load_files(client, args.bucket, args.file, "linking"),
     "START_LINKING": lambda client, args: start_job(client, "linking"),
@@ -172,7 +188,11 @@ ACTIONS = {
     "LOAD_DATA": lambda client, args: load_files(client, args.bucket, args.file, "ingestion"),
     "START_MIGRATION": lambda client, args: start_job(client, "ingestion"),
     "MIGRATION_STATUS": lambda client, args: check_status(client, args.bucket, args.file, "ingestion"),
+    "DELETE_START": lambda client, args: call_once(client, "POST", DELETE_START_PATH),
+    "DELETE_COUNT": lambda client, args: call_once(client, "GET", DELETE_COUNT_PATH),
+    "DELETE_STATUS": lambda client, args: call_once(client, "GET", DELETE_STATUS_PATH),
 }
+FILE_ACTIONS = {"LOAD_LINKING", "STATUS_CHECK", "LOAD_DATA", "MIGRATION_STATUS"}
 
 
 def main() -> int:
@@ -180,9 +200,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="DocuEdge migration runner")
     parser.add_argument("--action", required=True, choices=ACTIONS)
     parser.add_argument("--dns", required=True, help="API DNS hostname")
-    parser.add_argument("--bucket", required=True, help="S3 bucket name")
-    parser.add_argument("--file", required=True, help="S3 key of TXT file listing files")
+    parser.add_argument("--bucket", help="S3 bucket name (file-based actions)")
+    parser.add_argument("--file", help="S3 key of TXT file listing files (file-based actions)")
     args = parser.parse_args()
+    if args.action in FILE_ACTIONS and not (args.bucket and args.file):
+        parser.error(f"--bucket and --file are required for {args.action}")
 
     LOGGER.info("Action %s against https://%s", args.action, args.dns)
     secret = json.loads(SESSION.client("secretsmanager").get_secret_value(SecretId=CONFIG.secret_id)["SecretString"])
@@ -190,7 +212,11 @@ def main() -> int:
 
     started = time.monotonic()
     with httpx.Client(base_url=f"https://{args.dns}", auth=auth, timeout=CONFIG.timeout) as client:
-        failures = ACTIONS[args.action](client, args)
+        try:
+            failures = ACTIONS[args.action](client, args)
+        except httpx.HTTPStatusError:
+            LOGGER.error("Authentication failed (401), stopping %s", args.action)
+            return 1
 
     LOGGER.info("Finished %s in %.1fs (exit %d)", args.action, time.monotonic() - started, 1 if failures else 0)
     return 1 if failures else 0
