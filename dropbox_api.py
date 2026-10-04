@@ -15,10 +15,15 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import boto3
 import httpx
+from botocore.exceptions import BotoCoreError, ClientError
 
 LOGGER = logging.getLogger("docuedge")
 
@@ -32,10 +37,10 @@ DELETE_COUNT_PATH = "/delete/count"
 DELETE_STATUS_PATH = "/delete/status"
 BATCH_SIZE = 10
 BATCH_WAIT = 2
-STATUS_DELAY = 2
 START_TRIGGERS = 3
 START_API_WAIT = 30
 THREADS = 5
+STATUS_WORKERS = int(os.environ.get("STATUS_WORKERS", "5"))
 
 
 def _configure_logging():
@@ -54,6 +59,8 @@ class Config:
     secret_id: str
     region: str
     timeout: float
+    email_from: str
+    email_to: tuple
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -62,6 +69,8 @@ class Config:
             secret_id=os.environ["API_SECRET_ID"],
             region=os.environ.get("AWS_REGION", "us-west-2"),
             timeout=float(os.environ.get("HTTP_TIMEOUT", "60")),
+            email_from=os.environ.get("EMAIL_FROM", ""),
+            email_to=tuple(addr.strip() for addr in os.environ.get("EMAIL_TO", "").split(",") if addr.strip()),
         )
 
 
@@ -148,6 +157,36 @@ def start_job(client: httpx.Client, flow: str) -> int:
     return trigger(client, flow, f"{prefix}/start", {"threads": THREADS})
 
 
+def _fetch_status(client, path, flow, key):
+    res = _call(client, "GET", path, {"Key": key})
+    try:
+        return res.json() if res else None
+    except json.JSONDecodeError:
+        LOGGER.error("[%s] Non-JSON status for %s", flow, key)
+        return None
+
+
+def _email_report(subject, body, filename, csv_data):
+    if not (CONFIG.email_from and CONFIG.email_to):
+        LOGGER.warning("EMAIL_FROM/EMAIL_TO not set, skipping status email")
+        return
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = CONFIG.email_from
+    msg["To"] = ", ".join(CONFIG.email_to)
+    msg.attach(MIMEText(body))
+    attachment = MIMEApplication(csv_data, Name=filename)
+    attachment["Content-Disposition"] = f'attachment; filename="{filename}"'
+    msg.attach(attachment)
+
+    try:
+        SESSION.client("sesv2").send_email(Content={"Raw": {"Data": msg.as_bytes()}})
+        LOGGER.info("Status email sent to %s", ", ".join(CONFIG.email_to))
+    except (ClientError, BotoCoreError) as exc:
+        LOGGER.error("Failed to send status email: %s", exc)
+
+
 def check_status(client: httpx.Client, bucket: str, file_key: str, flow: str) -> int:
     """Write the status of every file in the input list to a CSV in S3 and return the failure count."""
     prefix, _ = FLOWS[flow]
@@ -156,27 +195,40 @@ def check_status(client: httpx.Client, bucket: str, file_key: str, flow: str) ->
     writer = csv.writer(buf)
     writer.writerow(["file_key", *STATUS_FIELDS, "status"])
 
-    failures = 0
-    for i, key in enumerate(keys, 1):
+    def fetch(i, key):
         LOGGER.info("[%s] [%d/%d] Checking %s", flow, i, len(keys), key)
-        res = _call(client, "GET", f"{prefix}/status", {"Key": key})
-        try:
-            data = res.json() if res else None
-        except json.JSONDecodeError:
-            LOGGER.error("[%s] Non-JSON status for %s", flow, key)
-            data = None
+        return _fetch_status(client, f"{prefix}/status", flow, key)
 
+    LOGGER.info("[%s] Checking %d files with %d workers", flow, len(keys), STATUS_WORKERS)
+    pool = ThreadPoolExecutor(max_workers=STATUS_WORKERS)
+    try:
+        results = list(pool.map(fetch, range(1, len(keys) + 1), keys))
+    finally:
+        pool.shutdown(cancel_futures=True)
+
+    failures = 0
+    for key, data in zip(keys, results):
         if data is None:
             failures += 1
             writer.writerow([key, "", "", "", "", "ERROR"])
         else:
             writer.writerow([key, *(data.get(f, 0) for f in STATUS_FIELDS), "OK"])
-        if i < len(keys):
-            time.sleep(STATUS_DELAY)
 
     csv_key = f"docuedge-migration/{flow}_status_{int(time.time())}.csv"
-    S3.put_object(Bucket=bucket, Key=csv_key, Body=buf.getvalue().encode(), ContentType="text/csv")
+    csv_data = buf.getvalue().encode()
+    S3.put_object(Bucket=bucket, Key=csv_key, Body=csv_data, ContentType="text/csv")
     LOGGER.info("[%s] Status done: %d ok, %d failed -> s3://%s/%s", flow, len(keys) - failures, failures, bucket, csv_key)
+
+    _email_report(
+        subject=f"DocuEdge {flow} status: {len(keys) - failures} ok, {failures} failed",
+        body=(
+            f"DocuEdge {flow} status check completed.\n\n"
+            f"Files checked: {len(keys)}\nOK: {len(keys) - failures}\nFailed: {failures}\n\n"
+            f"CSV attached and uploaded to s3://{bucket}/{csv_key}\n"
+        ),
+        filename=csv_key.rsplit("/", 1)[-1],
+        csv_data=csv_data,
+    )
     return failures
 
 
