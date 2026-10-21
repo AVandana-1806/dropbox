@@ -63,11 +63,21 @@ class CloudWatchBatchTransformer:
 
     def transform(self, record: dict) -> dict:
         """Turn one Firehose record into a Firehose transformation result."""
-        record_id = record["recordId"]
+        record_id = str(record.get("recordId", ""))
         try:
             envelope = json.loads(gzip.decompress(base64.b64decode(record["data"])))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (EOFError, KeyError, OSError, TypeError, ValueError) as exc:
             logger.error("record %s unparseable: %s", record_id, exc)
+            return {"recordId": record_id, "result": "ProcessingFailed"}
+
+        # Valid JSON that is not an object (a bare list or string) would blow up
+        # on the attribute access below; contain it to this record.
+        if not isinstance(envelope, dict):
+            logger.error(
+                "record %s is not a CloudWatch envelope: %s",
+                record_id,
+                type(envelope).__name__,
+            )
             return {"recordId": record_id, "result": "ProcessingFailed"}
 
         if envelope.get("messageType") != "DATA_MESSAGE":
