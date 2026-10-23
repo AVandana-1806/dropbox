@@ -4,3 +4,10 @@ fields @timestamp, @message
 | filter @message like /FLOW_CIVICA|Loading Civica|Civica SAVE|Civica GET|FLOW_STATUS_UPDATE|HTTP_ERROR|HTTP call failed|STALE_CONNECTION|Executing Salesforce|Loading Salesforce|Received sink record batch/
 | sort logTime asc
 | limit 10000
+
+
+
+filter @message like /task-0/
+| parse @message /event=(?<event>[A-Z_]+)/
+| stats count() by event
+| sort count() desc
