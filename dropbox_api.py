@@ -1,599 +1,433 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Transform: AWS::Serverless-2016-10-31
-Description: >
-  CloudWatch-to-Splunk log pipeline (minimal design): Firehose transform Lambda,
-  scheduled S3 failed-event replay Lambda, and the alarm suite that guards
-  against breakage, runaway invocations, and runaway cost.
+"""
+MSK Connect Connector Deployment Script.
 
-Globals:
-  Function:
-    Runtime: python3.13
-    Architectures: [arm64]          # ~20% cheaper per GB-second than x86_64
-    Tracing: Active
-    PropagateTags: true
-    Tags:
-      Pipeline: splunk-logs
+This script deploys a custom plugin JAR and a sink connector to an MSK Connect cluster.
 
-Parameters:
-  BackupBucketName:
-    Type: String
-    Description: Firehose backup bucket (splunk-failed/, processing-failed/)
-  DeliveryStreamName:
-    Type: String
-    Description: Firehose delivery stream name
-  FirehoseRoleArn:
-    Type: String
-    Description: Role Firehose assumes; granted lambda:InvokeFunction on the transform alias
-  HecEndpoint:
-    Type: String
-    Description: Splunk HEC base URL, e.g. https://splunk-host:8088
-  HecSecretArn:
-    Type: String
-  KmsKeyArn:
-    Type: String
-  AlarmEmail:
-    Type: String
-    Description: Address subscribed to the alarm topic
-  EnvironmentName:
-    Type: String
-    Description: Label shown in alert email headers, e.g. dev01
-  AlertFromEmail:
-    Type: String
-    Description: SES-verified sender for formatted transform alerts
-  AlertRecipients:
-    Type: CommaDelimitedList
-    Description: Recipients of formatted transform alerts
-  LogRetentionDays:
-    Type: Number
-    Default: 30
-    Description: Lambda log retention. Never leave this unset - unbounded log storage is a real cost line
-  # --- alarm thresholds, tuned at ~100 GB/day -------------------------------
-  TransformInvocationCeiling:
-    Type: Number
-    Default: 20000
-    Description: Invocations per hour that should never be exceeded (normal ~4200/hr at 1 MB buffers)
-  TransformConcurrencyWarn:
-    Type: Number
-    Default: 16
-    Description: Concurrent executions warning level (80% of the reserved 20)
-  ErrorBurstThreshold:
-    Type: Number
-    Default: 100
-    Description: Function errors in 5 minutes that indicate systemic breakage
-  MonthlyBudgetUsd:
-    Type: Number
-    Default: 400
-    Description: Monthly cost budget for resources tagged Pipeline=splunk-logs
+Usage:
+  python3 deploy_msk_connector.py --app APP_NAME --env ENV --version VERSION --jar JAR_PATH \
+    --env-properties ENV_PROPERTIES --secure-properties SECURE_PROPERTIES
 
-Resources:
+Arguments:
+    --app APP          Base name of the application (e.g., 'myapp').
+    --env ENV          Target environment (e.g., 'dev', 'qa', 'prod').
+    --version VERSION  Application version (e.g., '1.0.0').
+    --jar JAR_PATH      Path to the Mule application JAR file.
+    --env-properties ENV_PROPERTIES  Path to the non-secure properties file.
+    --secure-properties SECURE_PROPERTIES  Path to the secure properties file.
 
-  # ===========================================================================
-  # Alerting target
-  # ===========================================================================
-  AlarmTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${AWS::StackName}-alarms"
-      Subscription:
-        - Protocol: email
-          Endpoint: !Ref AlarmEmail
+WORKER_PROPERTIES is published as an MSK Connect worker configuration (temporary
+hardcoded values for testing). Worker configurations are immutable, so a change
+creates a new one and recreates the connector under the same name.
 
-  TransformAlertTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${AWS::StackName}-transform-alerts"
+"""
 
-  # ===========================================================================
-  # Alert Lambda - formats transform alarms into the HTML email
-  # ===========================================================================
-  AlertFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-alert-notification"
-      Description: Sends formatted HTML emails for transform Lambda alarms
-      CodeUri: ./src/alert/
-      Handler: alert_notification.handler
-      MemorySize: 256
-      Timeout: 30
-      Environment:
-        Variables:
-          FROM_EMAIL: !Ref AlertFromEmail
-          TO_EMAILS: !Join [",", !Ref AlertRecipients]
-          ENVIRONMENT: !Ref EnvironmentName
-          DELIVERY_STREAM_NAME: !Ref DeliveryStreamName
-          TRANSFORM_FUNCTION: !Ref TransformFunction
-          BACKUP_BUCKET: !Ref BackupBucketName
-      Policies:
-        - Statement:
-            - Sid: SendAlertEmail
-              Effect: Allow
-              Action: ses:SendEmail
-              Resource: "*"
-            - Sid: ReadPipelineMetrics
-              Effect: Allow
-              Action: cloudwatch:GetMetricData
-              Resource: "*"
-      Events:
-        TransformAlarms:
-          Type: SNS
-          Properties:
-            Topic: !Ref TransformAlertTopic
+import argparse
+import base64
+import hashlib
+import logging
+import sys
+import time
+from dataclasses import dataclass
+import boto3
+from botocore.exceptions import ClientError
 
-  AlertLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AlertFunction}"
-      RetentionInDays: !Ref LogRetentionDays
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+)
+for _logger in ("boto3", "botocore"):
+    logging.getLogger(_logger).setLevel(logging.WARNING)
+log = logging.getLogger("msk_connector_deploy")
 
-  # ===========================================================================
-  # Lambda 1 - Firehose transform (hot path)
-  # ===========================================================================
-  TransformFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-cw-splunk-transform"
-      Description: Decompresses CloudWatch batches into Splunk HEC raw lines
-      CodeUri: ./src/transform/
-      Handler: cw_splunk_transform.handler
-      MemorySize: 1024
-      Timeout: 300                        # Firehose's maximum for a processor
-      ReservedConcurrentExecutions: 20    # guarantees capacity AND caps spend
-      AutoPublishAlias: live              # Firehose points at the alias
-      Policies:
-        - Statement:
-            - Sid: ReingestOverflow
-              Effect: Allow
-              Action: firehose:PutRecordBatch
-              Resource: !Sub "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${DeliveryStreamName}"
+WAIT_POLL_SECONDS = 15
+WAIT_TIMEOUT_SECONDS = 900
 
-  TransformLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${TransformFunction}"
-      RetentionInDays: !Ref LogRetentionDays
+INFRA_KEYS = frozenset(
+    {
+        "kafka.connect.version",
+        "mcu.count",
+        "min.worker.count",
+        "max.worker.count",
+        "tls.bootstrap.servers",
+        "subnet.ids",
+        "security.group.ids",
+        "service.execution.role.arn",
+        "log.group.name",
+    }
+)
+WORKER_PROPERTIES = {
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "consumer.max.poll.records": "5",
+    "consumer.max.poll.interval.ms": "900000",
+    "consumer.partition.assignment.strategy": "org.apache.kafka.clients.consumer.CooperativeStickyAssignor",
+}
 
-  # Firehose invokes through its own role, so the grant lives on the function.
-  TransformInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref TransformFunction.Alias
-      Action: lambda:InvokeFunction
-      Principal: !Ref FirehoseRoleArn
 
-  # ===========================================================================
-  # Lambda 2 - scheduled S3 failed-event replay (recovery path)
-  # ===========================================================================
-  ReplayFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${AWS::StackName}-s3-failed-event-replay"
-      Description: Retries Firehose failure objects; quarantines permanent rejections
-      CodeUri: ./src/replay/
-      Handler: s3_failed_event_replay.handler
-      MemorySize: 512
-      Timeout: 600
-      ReservedConcurrentExecutions: 1     # only one copy ever runs
-      Environment:
-        Variables:
-          BUCKET_NAME: !Ref BackupBucketName
-          HEC_ENDPOINT: !Ref HecEndpoint
-          HEC_SECRET_ARN: !Ref HecSecretArn
-          DELIVERY_STREAM_NAME: !Ref DeliveryStreamName
-          FAILED_PREFIX: "failed-events/"
-          MAX_OBJECTS_PER_RUN: "200"
-          MIN_AGE_MINUTES: "15"
-          PERMANENT_ERROR_CODES: Lambda.ProcessingFailedStatus
-      Policies:
-        - Statement:
-            - Sid: ListBucket
-              Effect: Allow
-              Action: s3:ListBucket
-              Resource: !Sub "arn:${AWS::Partition}:s3:::${BackupBucketName}"
-            - Sid: ReadMoveObjects
-              Effect: Allow
-              Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
-              Resource: !Sub "arn:${AWS::Partition}:s3:::${BackupBucketName}/*"
-            - Sid: Reingest
-              Effect: Allow
-              Action: firehose:PutRecordBatch
-              Resource: !Sub "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${DeliveryStreamName}"
-            - Sid: ReadHecToken
-              Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref HecSecretArn
-            - Sid: UseKey
-              Effect: Allow
-              Action: [kms:Decrypt, kms:GenerateDataKey]
-              Resource: !Ref KmsKeyArn
-      Events:
-        HalfHourly:
-          Type: ScheduleV2               # EventBridge Scheduler
-          Properties:
-            ScheduleExpression: rate(30 minutes)
-            FlexibleTimeWindow:
-              Mode: "OFF"                # exact cadence, no jitter
-            RetryPolicy:
-              MaximumRetryAttempts: 2    # covers a throttle if the prior run is still going
-              MaximumEventAgeInSeconds: 600
+def read_properties(path: str) -> dict:
+    """Read a flat key=value properties file, skipping blanks and '#' comments."""
+    props = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                props[key.strip()] = value.strip()
+    return props
 
-  ReplayLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ReplayFunction}"
-      RetentionInDays: !Ref LogRetentionDays
 
-  # ===========================================================================
-  # A. Breakage alarms - the function itself is failing
-  # ===========================================================================
-  TransformErrorBurstAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-error-burst"
-      AlarmDescription: !Sub "${ErrorBurstThreshold}+ transform errors in 5 minutes - systemic breakage, records are heading to S3"
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: !Ref ErrorBurstThreshold
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+@dataclass(frozen=True)
+class DeployConfig:
+    """
+    Resolved deployment configuration for one environment.
+    """
 
-  TransformErrorRateAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-error-rate"
-      AlarmDescription: Transform error rate above 1% for 15 minutes - catches a slow bleed the burst alarm misses
-      Metrics:
-        - Id: errors
-          MetricStat:
-            Metric:
-              Namespace: AWS/Lambda
-              MetricName: Errors
-              Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-            Period: 300
-            Stat: Sum
-          ReturnData: false
-        - Id: invocations
-          MetricStat:
-            Metric:
-              Namespace: AWS/Lambda
-              MetricName: Invocations
-              Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-            Period: 300
-            Stat: Sum
-          ReturnData: false
-        - Id: rate
-          Expression: "100 * errors / MAX([invocations, 1])"
-          Label: Error rate %
-          ReturnData: true
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
-      Threshold: 1
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+    environment: str
+    plugin_name: str
+    connector_name: str
+    plugin_location: dict
+    connector_request: dict
+    worker_properties: dict
 
-  TransformThrottleAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-throttled"
-      AlarmDescription: Transform is being throttled - reserved concurrency is too low or something is looping
-      Namespace: AWS/Lambda
-      MetricName: Throttles
-      Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+    @property
+    def worker_config_name(self) -> str:
+        """Return a content-addressed worker configuration name."""
+        digest = hashlib.sha256(self.worker_properties_content.encode()).hexdigest()
+        return f"{self.connector_name}-{digest[:10]}"
 
-  TransformNearTimeoutAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-near-timeout"
-      AlarmDescription: p99 duration above 80% of the 300 s timeout - the next step is failed invocations
-      Namespace: AWS/Lambda
-      MetricName: Duration
-      Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-      ExtendedStatistic: p99
-      Period: 300
-      EvaluationPeriods: 3
-      Threshold: 240000
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+    @property
+    def worker_properties_content(self) -> str:
+        """Render worker properties as a connect-distributed.properties file."""
+        return "\n".join(f"{k}={v}" for k, v in sorted(self.worker_properties.items()))
 
-  TransformDroppedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-records-dropped"
-      AlarmDescription: >
-        Records were dropped without being delivered. Expected only for
-        CloudWatch control probes and empty batches; a sustained rate means
-        envelopes are arriving with no log events.
-      Namespace: LogPipeline
-      MetricName: Dropped
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 50
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "DeployConfig":
+        """
+        Build config and API request payloads from CLI args and properties files.
+        """
+        bucket, _, key = args.jar.removeprefix("s3://").partition("/")
+        env = read_properties(args.env_properties)
+        secure = read_properties(args.secure_properties)
 
-  TransformProcessingFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-records-rejected"
-      AlarmDescription: Records were marked ProcessingFailed and sent to S3 - corrupt data or an event too large to split
-      Namespace: LogPipeline
-      MetricName: ProcessingFailed
-      Statistic: Sum
-      Period: 900
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+        connector_props = {k: v for k, v in env.items() if k not in INFRA_KEYS}
 
-  # ===========================================================================
-  # B. Cost-runaway alarms - nothing is "broken" but spend is climbing
-  # ===========================================================================
-  TransformInvocationCeilingAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-invocations-high"
-      AlarmDescription: Invocations far above the expected hourly rate - log storm, buffer misconfiguration, or a re-ingestion loop
-      Namespace: AWS/Lambda
-      MetricName: Invocations
-      Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 1
-      Threshold: !Ref TransformInvocationCeiling
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+        overlap = set(connector_props) & set(secure)
+        if overlap:
+            raise ValueError(
+                f"keys present in both {args.env_properties} and "
+                f"{args.secure_properties}: {sorted(overlap)}"
+            )
 
-  TransformInvocationAnomalyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-invocations-anomalous"
-      AlarmDescription: Invocations outside the learned normal band - catches a doubling long before the fixed ceiling does
-      Metrics:
-        - Id: invocations
-          MetricStat:
-            Metric:
-              Namespace: AWS/Lambda
-              MetricName: Invocations
-              Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-            Period: 900
-            Stat: Sum
-          ReturnData: true
-        - Id: band
-          Expression: ANOMALY_DETECTION_BAND(invocations, 3)
-          ReturnData: true
-      ThresholdMetricId: band
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
-      ComparisonOperator: GreaterThanUpperThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+        connector_name = f"{args.app}-{args.env}"
+        return cls(
+            environment=args.env,
+            plugin_name=f"{args.app}-{args.version}".replace(".", "-"),
+            connector_name=connector_name,
+            plugin_location={
+                "s3Location": {"bucketArn": f"arn:aws:s3:::{bucket}", "fileKey": key}
+            },
+            connector_request={
+                "connectorName": connector_name,
+                "kafkaConnectVersion": env["kafka.connect.version"],
+                "capacity": {
+                    "autoScaling": {
+                        "mcuCount": int(env["mcu.count"]),
+                        "minWorkerCount": int(env["min.worker.count"]),
+                        "maxWorkerCount": int(env["max.worker.count"]),
+                        "scaleInPolicy": {"cpuUtilizationPercentage": 20},
+                        "scaleOutPolicy": {"cpuUtilizationPercentage": 80},
+                    }
+                },
+                "connectorConfiguration": connector_props | secure,
+                "kafkaCluster": {
+                    "apacheKafkaCluster": {
+                        "bootstrapServers": env["tls.bootstrap.servers"],
+                        "vpc": {
+                            "subnets": [
+                                s.strip() for s in env["subnet.ids"].split(",")
+                            ],
+                            "securityGroups": [
+                                s.strip() for s in env["security.group.ids"].split(",")
+                            ],
+                        },
+                    }
+                },
+                "kafkaClusterEncryptionInTransit": {"encryptionType": "TLS"},
+                "kafkaClusterClientAuthentication": {"authenticationType": "NONE"},
+                "serviceExecutionRoleArn": env["service.execution.role.arn"],
+                "logDelivery": {
+                    "workerLogDelivery": {
+                        "cloudWatchLogs": {
+                            "enabled": True,
+                            "logGroup": env["log.group.name"],
+                        }
+                    }
+                },
+            },
+            worker_properties=WORKER_PROPERTIES,
+        )
 
-  ReingestionLoopAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-reingestion-sustained"
-      AlarmDescription: >
-        Records are being re-ingested continuously. Each re-ingested record is
-        billed twice (once deferred, once re-processed) and re-enters Firehose,
-        so a sustained rate is the pipeline's main silent cost leak. Usually
-        means the Firehose buffer is too large for the log groups' event sizes.
-      Namespace: LogPipeline
-      MetricName: Reingested
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
-      Threshold: 500
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
 
-  TransformConcurrencyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-transform-concurrency-high"
-      AlarmDescription: Concurrent executions approaching the reserved limit - throttling and cost both follow
-      Namespace: AWS/Lambda
-      MetricName: ConcurrentExecutions
-      Dimensions: [{Name: FunctionName, Value: !Ref TransformFunction}]
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: !Ref TransformConcurrencyWarn
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref TransformAlertTopic]
+class ConnectorDeployer:
+    """
+    Manages the shared custom plugin and the per-environment connector.
+    """
 
-  PipelineBudget:
-    Type: AWS::Budgets::Budget
-    Properties:
-      Budget:
-        BudgetName: !Sub "${AWS::StackName}-monthly"
-        BudgetType: COST
-        TimeUnit: MONTHLY
-        BudgetLimit:
-          Amount: !Ref MonthlyBudgetUsd
-          Unit: USD
-        CostFilters:
-          TagKeyValue: ["user:Pipeline$splunk-logs"]
-      NotificationsWithSubscribers:
-        - Notification:
-            NotificationType: FORECASTED
-            ComparisonOperator: GREATER_THAN
-            Threshold: 100
-            ThresholdType: PERCENTAGE
-          Subscribers:
-            - SubscriptionType: EMAIL
-              Address: !Ref AlarmEmail
+    def __init__(self, config: DeployConfig):
+        self.config = config
+        self.client = boto3.client("kafkaconnect")
 
-  # ===========================================================================
-  # C. Recovery-path alarms
-  # ===========================================================================
-  ReplayFunctionErrorAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-replay-function-error"
-      AlarmDescription: The replay Lambda itself crashed - failed objects are not being retried
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions: [{Name: FunctionName, Value: !Ref ReplayFunction}]
-      Statistic: Sum
-      Period: 1800
-      EvaluationPeriods: 2
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlarmTopic]
+    def ensure_plugin(self) -> tuple[str, int]:
+        """Create or reuse the shared plugin for this version, returning (arn, revision)."""
+        name = self.config.plugin_name
+        pages = self.client.get_paginator("list_custom_plugins").paginate(
+            namePrefix=name
+        )
+        existing = next(
+            (
+                p
+                for page in pages
+                for p in page.get("customPlugins", [])
+                if p["name"] == name
+            ),
+            None,
+        )
+        if existing:
+            log.info("Plugin '%s' already exists — reusing.", name)
+            arn = existing["customPluginArn"]
+        else:
+            log.info("Creating plugin '%s' from %s", name, self.config.plugin_location)
+            arn = self.client.create_custom_plugin(
+                name=name, contentType="JAR", location=self.config.plugin_location
+            )["customPluginArn"]
 
-  ReplayNotRunningAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-replay-not-running"
-      AlarmDescription: No replay invocation in 2 hours - the schedule is disabled or failing, so failures are piling up unnoticed
-      Namespace: AWS/Lambda
-      MetricName: Invocations
-      Dimensions: [{Name: FunctionName, Value: !Ref ReplayFunction}]
-      Statistic: Sum
-      Period: 7200
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching       # missing data IS the failure here
-      AlarmActions: [!Ref AlarmTopic]
+        detail = self._wait(
+            lambda: self.client.describe_custom_plugin(customPluginArn=arn),
+            state_key="customPluginState",
+            target={"ACTIVE"},
+            failure={"CREATE_FAILED"},
+            what=f"plugin {name}",
+        )
+        return arn, detail["latestRevision"]["revision"]
 
-  ReplayNearTimeoutAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-replay-near-timeout"
-      AlarmDescription: Replay runs are hitting the time guard - the backlog is draining slower than it arrives
-      Namespace: AWS/Lambda
-      MetricName: Duration
-      Dimensions: [{Name: FunctionName, Value: !Ref ReplayFunction}]
-      Statistic: Maximum
-      Period: 1800
-      EvaluationPeriods: 3
-      Threshold: 480000
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlarmTopic]
+    def ensure_worker_config(self) -> dict | None:
+        """Create or reuse the worker configuration, returning its connector reference."""
+        if not self.config.worker_properties:
+            log.info("No worker properties — using the MSK Connect default.")
+            return None
 
-  # Needs a bucket MetricsConfiguration with Prefix quarantine/ (bucket stack).
-  QuarantineNotEmptyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-quarantine-not-empty"
-      AlarmDescription: An object was permanently rejected and moved to quarantine/ - needs human triage
-      Namespace: AWS/S3
-      MetricName: NumberOfObjects
-      Dimensions:
-        - {Name: BucketName, Value: !Ref BackupBucketName}
-        - {Name: FilterId, Value: quarantine}
-      Statistic: Maximum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlarmTopic]
+        name = self.config.worker_config_name
+        pages = self.client.get_paginator("list_worker_configurations").paginate(
+            namePrefix=name
+        )
+        existing = next(
+            (
+                w
+                for page in pages
+                for w in page.get("workerConfigurations", [])
+                if w["name"] == name
+            ),
+            None,
+        )
+        if existing:
+            log.info("Worker configuration '%s' already exists — reusing.", name)
+        else:
+            log.info(
+                "Creating worker configuration '%s':\n%s",
+                name,
+                self.config.worker_properties_content,
+            )
+            existing = self.client.create_worker_configuration(
+                name=name,
+                propertiesFileContent=base64.b64encode(
+                    self.config.worker_properties_content.encode()
+                ).decode(),
+            )
+        return {
+            "workerConfigurationArn": existing["workerConfigurationArn"],
+            "revision": existing["latestRevision"]["revision"],
+        }
 
-  # ===========================================================================
-  # D. Delivery alarms - Firehose and the silent-gap case
-  # ===========================================================================
-  SplunkDeliveryFailureAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-splunk-delivery-failing"
-      AlarmDescription: Firehose delivery success below 99.9% - records are routing to S3
-      Namespace: AWS/Firehose
-      MetricName: DeliveryToSplunk.Success
-      Dimensions: [{Name: DeliveryStreamName, Value: !Ref DeliveryStreamName}]
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 0.999
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlarmTopic]
+    def deploy_connector(
+        self, plugin_arn: str, plugin_revision: int, worker_config: dict | None
+    ) -> str:
+        """
+        Create the connector, update it in place, or recreate it on plugin or worker config change.
+        """
+        name = self.config.connector_name
+        pages = self.client.get_paginator("list_connectors").paginate(
+            connectorNamePrefix=name
+        )
+        existing = next(
+            (
+                c
+                for page in pages
+                for c in page.get("connectors", [])
+                if c["connectorName"] == name
+            ),
+            None,
+        )
 
-  SplunkDataFreshnessAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-splunk-data-stale"
-      AlarmDescription: Records are aging in Firehose - Splunk is slow or backpressured
-      Namespace: AWS/Firehose
-      MetricName: DeliveryToSplunk.DataFreshness
-      Dimensions: [{Name: DeliveryStreamName, Value: !Ref DeliveryStreamName}]
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 900
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlarmTopic]
+        if existing is None:
+            return self._create_connector(plugin_arn, plugin_revision, worker_config)
 
-  SilentGapAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-silent-ingestion-gap"
-      AlarmDescription: >
-        Firehose is receiving almost nothing while the pipeline normally runs.
-        This is the one failure S3 cannot see - nothing failed, logs simply
-        stopped entering. Logs remain in CloudWatch for 14 days; follow the
-        manual backfill runbook.
-      Namespace: AWS/Firehose
-      MetricName: IncomingRecords
-      Dimensions: [{Name: DeliveryStreamName, Value: !Ref DeliveryStreamName}]
-      Statistic: Sum
-      Period: 1800
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions: [!Ref AlarmTopic]
+        arn = existing["connectorArn"]
+        detail = self.client.describe_connector(connectorArn=arn)
+        current_plugin_arn = detail["plugins"][0]["customPlugin"]["customPluginArn"]
+        current_worker_arn = detail.get("workerConfiguration", {}).get(
+            "workerConfigurationArn"
+        )
+        desired_worker_arn = worker_config and worker_config["workerConfigurationArn"]
 
-  # ===========================================================================
-  # E. One composite alarm to page on
-  # ===========================================================================
-  PipelineUnhealthyAlarm:
-    Type: AWS::CloudWatch::CompositeAlarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-PIPELINE-UNHEALTHY"
-      AlarmDescription: Page on this one; the individual alarms below say which part broke
-      AlarmRule: !Sub
-        - "ALARM(${A}) OR ALARM(${B}) OR ALARM(${C}) OR ALARM(${D}) OR ALARM(${E})"
-        - A: !Ref TransformErrorBurstAlarm
-          B: !Ref TransformThrottleAlarm
-          C: !Ref SplunkDeliveryFailureAlarm
-          D: !Ref SilentGapAlarm
-          E: !Ref ReplayNotRunningAlarm
-      ActionsEnabled: true
-      AlarmActions: [!Ref AlarmTopic]
+        reasons = [
+            reason
+            for reason, changed in (
+                ("plugin", current_plugin_arn != plugin_arn),
+                ("worker configuration", current_worker_arn != desired_worker_arn),
+            )
+            if changed
+        ]
+        if reasons:
+            log.info(
+                "Connector '%s' has a different %s — deleting and recreating.",
+                name,
+                " and ".join(reasons),
+            )
+            self.client.delete_connector(
+                connectorArn=arn, currentVersion=detail["currentVersion"]
+            )
+            self._wait_deleted(arn)
+            return self._create_connector(plugin_arn, plugin_revision, worker_config)
 
-Outputs:
-  TransformFunctionAlias:
-    Description: Point the Firehose processor at this ARN
-    Value: !Ref TransformFunction.Alias
-  ReplayFunctionArn:
-    Value: !GetAtt ReplayFunction.Arn
-  AlarmTopicArn:
-    Value: !Ref AlarmTopic
-  TransformAlertTopicArn:
-    Value: !Ref TransformAlertTopic
+        desired_config = self.config.connector_request["connectorConfiguration"]
+        if detail["connectorConfiguration"] == desired_config:
+            log.info("Connector '%s' already has the desired config — no action.", name)
+            return arn
+
+        log.info("Same plugin — updating connector '%s' config in place.", name)
+        self.client.update_connector(
+            connectorArn=arn,
+            currentVersion=detail["currentVersion"],
+            connectorConfiguration=self.config.connector_request[
+                "connectorConfiguration"
+            ],
+        )
+        self._wait_running(arn)
+        return arn
+
+    def _create_connector(
+        self, plugin_arn: str, plugin_revision: int, worker_config: dict | None
+    ) -> str:
+        log.info("Creating connector '%s'...", self.config.connector_name)
+        request = self.config.connector_request | {
+            "plugins": [
+                {
+                    "customPlugin": {
+                        "customPluginArn": plugin_arn,
+                        "revision": plugin_revision,
+                    }
+                }
+            ]
+        }
+        if worker_config:
+            request["workerConfiguration"] = worker_config
+        arn = self.client.create_connector(**request)["connectorArn"]
+        self._wait_running(arn)
+        return arn
+
+    def _wait(
+        self, describe, state_key: str, target: set, failure: set, what: str
+    ) -> dict:
+        start = time.monotonic()
+        while True:
+            detail = describe()
+            state = detail[state_key]
+            if state in target:
+                log.info("%s reached state %s.", what, state)
+                return detail
+            if state in failure:
+                raise RuntimeError(
+                    f"{what} entered {state}: {detail.get('stateDescription', 'no details')}"
+                )
+            if time.monotonic() - start > WAIT_TIMEOUT_SECONDS:
+                raise TimeoutError(
+                    f"timed out waiting for {what} (last state: {state})"
+                )
+            time.sleep(WAIT_POLL_SECONDS)
+
+    def _wait_running(self, arn: str):
+        self._wait(
+            lambda: self.client.describe_connector(connectorArn=arn),
+            state_key="connectorState",
+            target={"RUNNING"},
+            failure={"FAILED"},
+            what=f"connector {self.config.connector_name}",
+        )
+
+    def _wait_deleted(self, arn: str):
+        start = time.monotonic()
+        while True:
+            try:
+                self.client.describe_connector(connectorArn=arn)
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NotFoundException":
+                    log.info("Connector deleted.")
+                    return
+                raise
+            if time.monotonic() - start > WAIT_TIMEOUT_SECONDS:
+                raise TimeoutError("timed out waiting for connector deletion")
+            time.sleep(WAIT_POLL_SECONDS)
+
+
+def parse_args():
+    """
+    Parses command-line arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Deploy plugin and sink connector to MSK Connect"
+    )
+    parser.add_argument("-a", "--app", required=True, help="Application name")
+    parser.add_argument("-e", "--env", required=True, help="Environment (dev/qa/prod)")
+    parser.add_argument("-v", "--version", required=True, help="Application version")
+    parser.add_argument("-j", "--jar", required=True, help="s3 URI of the plugin JAR")
+    parser.add_argument(
+        "-p", "--env-properties", required=True, help="non-secure properties file"
+    )
+    parser.add_argument(
+        "-s", "--secure-properties", required=True, help="Secure properties file"
+    )
+    return parser.parse_args()
+
+
+def main():
+    """
+    Main entry point.
+    """
+    try:
+        config = DeployConfig.from_args(parse_args())
+    except (OSError, ValueError, KeyError) as e:
+        log.exception("Config error: %s", e)
+        sys.exit(1)
+
+    log.info(
+        "Deploying to '%s' (plugin=%s, connector=%s)",
+        config.environment,
+        config.plugin_name,
+        config.connector_name,
+    )
+
+    deployer = ConnectorDeployer(config)
+    try:
+        plugin_arn, plugin_revision = deployer.ensure_plugin()
+        worker_config = deployer.ensure_worker_config()
+        connector_arn = deployer.deploy_connector(
+            plugin_arn, plugin_revision, worker_config
+        )
+    except (ClientError, RuntimeError, TimeoutError) as e:
+        log.exception("Deployment failed: %s", e)
+        sys.exit(1)
+
+    log.info("Deployment complete: %s", connector_arn)
+
+
+if __name__ == "__main__":
+    main()
