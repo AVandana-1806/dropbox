@@ -15,9 +15,10 @@ Arguments:
     --env-properties ENV_PROPERTIES  Path to the non-secure properties file.
     --secure-properties SECURE_PROPERTIES  Path to the secure properties file.
 
-WORKER_PROPERTIES is published as an MSK Connect worker configuration (temporary
-hardcoded values for testing). Worker configurations are immutable, so a change
-creates a new one and recreates the connector under the same name.
+Keys prefixed with 'worker.config.' in the env properties file are stripped of the
+prefix and published as an MSK Connect worker configuration (e.g.
+'worker.config.consumer.max.poll.records=100'). Worker configurations are immutable,
+so a change creates a new one and recreates the connector under the same name.
 
 """
 
@@ -54,13 +55,8 @@ INFRA_KEYS = frozenset(
         "log.group.name",
     }
 )
-WORKER_PROPERTIES = {
-    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-    "value.converter": "org.apache.kafka.connect.storage.StringConverter",
-    "consumer.max.poll.records": "5",
-    "consumer.max.poll.interval.ms": "900000",
-    "consumer.partition.assignment.strategy": "org.apache.kafka.clients.consumer.CooperativeStickyAssignor",
-}
+WORKER_PREFIX = "worker.config."
+WORKER_REQUIRED_KEYS = ("key.converter", "value.converter")
 
 
 def read_properties(path: str) -> dict:
@@ -108,7 +104,22 @@ class DeployConfig:
         env = read_properties(args.env_properties)
         secure = read_properties(args.secure_properties)
 
-        connector_props = {k: v for k, v in env.items() if k not in INFRA_KEYS}
+        worker = {
+            k.removeprefix(WORKER_PREFIX): v
+            for k, v in env.items()
+            if k.startswith(WORKER_PREFIX)
+        }
+        missing = [k for k in WORKER_REQUIRED_KEYS if worker and k not in worker]
+        if missing:
+            raise ValueError(
+                f"worker configuration in {args.env_properties} is missing "
+                f"required keys: {[WORKER_PREFIX + k for k in missing]}"
+            )
+        connector_props = {
+            k: v
+            for k, v in env.items()
+            if k not in INFRA_KEYS and not k.startswith(WORKER_PREFIX)
+        }
 
         overlap = set(connector_props) & set(secure)
         if overlap:
@@ -163,7 +174,7 @@ class DeployConfig:
                     }
                 },
             },
-            worker_properties=WORKER_PROPERTIES,
+            worker_properties=worker,
         )
 
 
@@ -212,7 +223,7 @@ class ConnectorDeployer:
     def ensure_worker_config(self) -> dict | None:
         """Create or reuse the worker configuration, returning its connector reference."""
         if not self.config.worker_properties:
-            log.info("No worker properties — using the MSK Connect default.")
+            log.info("No worker.config.* properties — using the MSK Connect default.")
             return None
 
         name = self.config.worker_config_name
