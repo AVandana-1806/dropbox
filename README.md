@@ -1,269 +1,49 @@
-<!DOCTYPE html>
-<html lang="en">
+# Build the connector JAR (same Maven stage pattern as the Snowflake image).
+FROM maven:3.9-eclipse-temurin-21 AS build
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Log Pipeline Alert</title>
-    <style>
-        body {
-            font-family: -apple-system, "Segoe UI", Arial, sans-serif;
-            line-height: 1.5;
-            margin: 0;
-            padding: 24px 12px;
-            background-color: #eef1f5;
-            color: #1f2933;
-        }
+ARG VERSION=1.0.0-SNAPSHOT
+WORKDIR /build
 
-        .container {
-            max-width: 720px;
-            margin: 0 auto;
-            background: #ffffff;
-            border: 1px solid #dfe3e8;
-            border-radius: 6px;
-            overflow: hidden;
-        }
+# Dependencies first, so they are cached until pom.xml changes.
+COPY pom.xml .
+RUN mvn -B -q -Dversion=${VERSION} dependency:go-offline
 
-        .masthead {
-            border-left: 5px solid #c0392b;
-            padding: 20px 28px 18px 24px;
-            border-bottom: 1px solid #e6e9ee;
-        }
+COPY src ./src
+RUN mvn -B -Dversion=${VERSION} package
 
-        h1 {
-            font-size: 15px;
-            font-weight: 600;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: #c0392b;
-            margin: 0 0 8px 0;
-        }
+FROM amazoncorretto:21-al2023-headless
 
-        .alarm-name {
-            font-size: 20px;
-            font-weight: 600;
-            color: #1f2933;
-            word-break: break-all;
-        }
+ARG SCALA_VERSION=2.13
+# Matches connect-api in pom.xml, so the runtime is what the connector compiles against.
+ARG KAFKA_VERSION=4.2.0
 
-        .meta {
-            font-size: 13px;
-            color: #6b7684;
-            margin: 8px 0 0 0;
-        }
+RUN dnf install -y awscli-2 jq tar gzip \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
-        .meta strong {
-            color: #3e4c59;
-            font-weight: 600;
-        }
+RUN mkdir -p /app/kafka /app/tmp \
+    && curl -fsSL https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_${SCALA_VERSION}-${KAFKA_VERSION}.tgz \
+       | tar -xz -C /app/kafka --strip-components=1
 
-        .body {
-            padding: 8px 28px 28px 28px;
-        }
+# Shaded connector JAR from the build stage.
+COPY --from=build /build/target/cares-civica-connector-*.jar /app/plugins/cares-civica-connector/
 
-        h2 {
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: #8694a3;
-            margin: 28px 0 0 0;
-        }
+COPY docker/connect-distributed.properties /app/kafka/config/connect-distributed.properties
+# Console-only logging (CloudWatch), so no connect.log builds up inside the task.
+COPY docker/connect-log4j2.yaml /app/kafka/config/connect-log4j2.yaml
+COPY docker/start-kafka-connect.sh /app/start-kafka-connect.sh
+RUN chmod +x /app/start-kafka-connect.sh
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 1rem;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-            border-radius: 8px;
-            overflow: hidden;
-        }
+ENV KAFKA_HEAP_OPTS="-XX:InitialRAMPercentage=25.0 -XX:MaxRAMPercentage=75.0"
 
-        thead {
-            background-color: #1a72e8
-        }
+# Secrets Manager names read by start-kafka-connect.sh at startup; {env} is replaced with the
+# environment taken from the container name (e.g. cares300).
+ENV MSK_CLIENT_SECRET_NAME="civica-connect/{env}/msk-client-cert" \
+    CONNECTOR_SECRET_NAME="civica-connect/{env}/connector"
 
-        th {
-            padding: 14px 16px;
-            text-align: left;
-            font-weight: 700;
-            color: #ffffff;
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
+# The task runs with readonlyRootFilesystem and mounts a volume at /app; ECS copies the image's /app into
+# it at task start, so /app is the task's own writable copy. Must come after every step that writes /app.
+VOLUME ["/app"]
 
-        td {
-            padding: 14px 16px;
-            border-bottom: 1px solid #e9ecef;
-            font-size: 14px;
-        }
-
-        tbody tr {
-            background: #ffffff;
-        }
-
-        tbody tr:nth-child(even) {
-            background: #f8f9fa;
-        }
-
-        td.alert {
-            color: #c0392b;
-            font-weight: 700;
-        }
-
-        ul {
-            list-style-type: none;
-            padding: 0;
-            margin: 10px 0 0 0;
-        }
-
-        li {
-            background: #fdf3f2;
-            border-left: 4px solid #c0392b;
-            padding: 12px 16px;
-            font-size: 13px;
-            color: #3e4c59;
-            border-radius: 0 3px 3px 0;
-        }
-
-        li.success {
-            background: #f1f8f3;
-            border-left-color: #2f855a;
-        }
-
-        li.failure {
-            background: #fdf3f2;
-            border-left-color: #c0392b;
-        }
-
-        li.rollback {
-            background: #fdf6ed;
-            border-left-color: #c2700e;
-        }
-
-        li.skipped {
-            background: #f5f7fa;
-            border-left-color: #8694a3;
-        }
-
-        li strong {
-            color: #1f2933;
-        }
-
-        .actions {
-            margin-top: 28px;
-        }
-
-        .actions a {
-            display: inline-block;
-            text-decoration: none;
-            font-size: 13px;
-            font-weight: 600;
-            padding: 9px 18px;
-            border-radius: 4px;
-            margin-right: 8px;
-        }
-
-        .actions a.primary {
-            background: #1f3a5f;
-            color: #ffffff;
-        }
-
-        .actions a.secondary {
-            color: #1f3a5f;
-            border: 1px solid #c6cdd6;
-        }
-
-        .footer {
-            padding: 14px 28px;
-            background: #f5f7fa;
-            border-top: 1px solid #e6e9ee;
-            text-align: center;
-            font-size: 11px;
-            color: #8694a3;
-        }
-
-        .footer p {
-            margin: 0;
-        }
-    </style>
-</head>
-
-<body>
-    <div class="container">
-
-        <div class="masthead">
-            <h1>Log Pipeline Alert</h1>
-            <div class="alarm-name">splunk-logs-transform-processing-failed</div>
-            <p class="meta">
-                <strong>dev01</strong> &nbsp;&middot;&nbsp;
-                us-west-2 &nbsp;&middot;&nbsp;
-                2026-10-20T02:04:17.482+0000
-            </p>
-        </div>
-
-        <div class="body">
-
-            <h2>Alarm Detail</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Field</th>
-                        <th>Value</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td>Metric</td>
-                        <td>ProcessingFailed (LogPipeline)</td>
-                    </tr>
-                    <tr>
-                        <td>Condition</td>
-                        <td>SUM GreaterThanThreshold 0.0 for 1 period(s) of 300s</td>
-                    </tr>
-                    <tr>
-                        <td>Reason</td>
-                        <td>Threshold Crossed: 1 datapoint [11.0 (20/10/26 02:00:00)] was greater than the threshold (0.0).</td>
-                    </tr>
-                </tbody>
-            </table>
-
-            <h2>Pipeline State</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Stage</th>
-                        <th>Signal</th>
-                        <th>Value</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td>CloudWatch to Firehose</td><td>IncomingRecords (15m)</td><td>7,997</td></tr>
-<tr><td>Transform</td><td>Errors (15m)</td><td class="alert">11</td></tr>
-<tr><td>Transform</td><td>Throttles (15m)</td><td>0</td></tr>
-<tr><td>Firehose to Splunk</td><td>Delivery success</td><td>100.00%</td></tr>
-<tr><td>Recovery</td><td>Records rejected (15m)</td><td class="alert">11</td></tr>
-                </tbody>
-            </table>
-
-            <h2>Status</h2>
-            <ul>
-                <li class="failure"><strong>In alarm.</strong> Records failed transformation and were written to S3 - they are not in Splunk.</li>
-            </ul>
-
-            <div class="actions">
-                <a class="primary" href="https://console.aws.amazon.com/cloudwatch">View Alarm</a>
-                <a class="secondary" href="https://console.aws.amazon.com/cloudwatch/logs">Lambda Logs</a>
-            </div>
-
-        </div>
-
-        <div class="footer">
-            <p>Report generated by <strong>CDI DevOps</strong></p>
-        </div>
-
-    </div>
-</body>
-
-</html>
+EXPOSE 8083
+ENTRYPOINT ["/app/start-kafka-connect.sh"]
