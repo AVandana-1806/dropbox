@@ -52,15 +52,18 @@ MSK_CLIENT_SECRET=$(aws secretsmanager get-secret-value --region "$REGION" \
 	--secret-id "$MSK_CLIENT_SECRET_NAME" --query SecretString --output text)
 require "secret ${MSK_CLIENT_SECRET_NAME}" "$MSK_CLIENT_SECRET"
 
-# The secret holds one PEM (encrypted key, client certificate and CA chain together) plus the key password.
-MSK_CLIENT_PEM=$(secret_key "$MSK_CLIENT_SECRET" pem)
-MSK_CLIENT_KEY_PASSWORD=$(secret_key "$MSK_CLIENT_SECRET" password)
-require "${MSK_CLIENT_SECRET_NAME}:pem" "$MSK_CLIENT_PEM"
-require "${MSK_CLIENT_SECRET_NAME}:password" "$MSK_CLIENT_KEY_PASSWORD"
+MSK_CLIENT_KEY=$(secret_key "$MSK_CLIENT_SECRET" private_key)
+MSK_CLIENT_CERT=$(secret_key "$MSK_CLIENT_SECRET" certificate)
+MSK_CLIENT_CERT_CHAIN=$(secret_key "$MSK_CLIENT_SECRET" certificate_chain)
+MSK_CLIENT_KEY_PASSWORD=$(secret_key "$MSK_CLIENT_SECRET" private_key_password)
+require "${MSK_CLIENT_SECRET_NAME}:private_key" "$MSK_CLIENT_KEY"
+require "${MSK_CLIENT_SECRET_NAME}:certificate" "$MSK_CLIENT_CERT"
+require "${MSK_CLIENT_SECRET_NAME}:certificate_chain" "$MSK_CLIENT_CERT_CHAIN"
+require "${MSK_CLIENT_SECRET_NAME}:private_key_password" "$MSK_CLIENT_KEY_PASSWORD"
 
-# Written as-is; readable by this user only.
+# One PEM file with the encrypted private key, client certificate and CA chain; readable by this user only.
 mkdir -p "$(dirname "$CLIENT_PEM")"
-(umask 077 && printf '%s\n' "$MSK_CLIENT_PEM" >"$CLIENT_PEM")
+(umask 077 && printf '%s\n%s\n%s\n' "$MSK_CLIENT_KEY" "$MSK_CLIENT_CERT" "$MSK_CLIENT_CERT_CHAIN" >"$CLIENT_PEM")
 export MSK_CLIENT_KEY_PASSWORD
 
 KAFKA_MSK_CLUSTER_ARN=$(aws kafka list-clusters --region "$REGION" |
