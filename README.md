@@ -1,11 +1,11 @@
 # Shared Kafka Connect worker image; build once per connector:
 #   Civica:    docker build -f docker/Dockerfile --build-arg CONNECTOR=civica --build-arg VERSION=<x.y.z> \
 #                --build-context connector=<repo B> -t <ecr>/civica-connect:<x.y.z> .
-#   Snowflake: docker build -f docker/Dockerfile --build-arg CONNECTOR=snowflake --build-arg KAFKA_VERSION=4.0.0 \
+#   Snowflake: docker build -f docker/Dockerfile --build-arg CONNECTOR=snowflake \
 #                -t <ecr>/snowflake-connect:<x.y.z> .
 ARG CONNECTOR=civica
 
-# Civica: build the connector JAR from repo B (same Maven stage pattern as the Snowflake image).
+# Civica: build the connector JAR from repo B.
 FROM maven:3.9-eclipse-temurin-21 AS plugin-civica
 ARG VERSION=1.0.0-SNAPSHOT
 WORKDIR /build
@@ -22,7 +22,7 @@ RUN mvn -B -Dversion=${VERSION} package \
 # Snowflake: download the connector JARs (replace with your current Snowflake Maven step).
 FROM maven:3.9-eclipse-temurin-21 AS plugin-snowflake
 WORKDIR /build
-COPY docker/snowflake/pom.xml .
+COPY docker/snowflake-pom.xml pom.xml
 RUN mvn -B -q dependency:copy-dependencies -DoutputDirectory=/plugins/snowflake-kafka-connector
 
 # Only the selected connector's stage is built.
@@ -30,9 +30,7 @@ FROM plugin-${CONNECTOR} AS plugin
 
 FROM amazoncorretto:21-al2023-headless
 
-ARG CONNECTOR
 ARG SCALA_VERSION=2.13
-# Matches connect-api in pom.xml, so the runtime is what the connector compiles against.
 ARG KAFKA_VERSION=4.2.0
 
 RUN dnf install -y awscli-2 jq tar gzip \
@@ -46,10 +44,10 @@ RUN mkdir -p /app/kafka /app/tmp \
 # Connector JARs from the selected plugin stage.
 COPY --from=plugin /plugins/ /app/plugins/
 
-COPY docker/${CONNECTOR}/connect-distributed.properties /app/kafka/config/connect-distributed.properties
+COPY docker/connect-distributed.properties /app/kafka/config/connect-distributed.properties
 # Console-only logging (CloudWatch), so no connect.log builds up inside the task.
-COPY docker/${CONNECTOR}/connect-log4j2.yaml /app/kafka/config/connect-log4j2.yaml
-COPY docker/${CONNECTOR}/start-kafka-connect.sh /app/start-kafka-connect.sh
+COPY docker/connect-log4j2.yaml /app/kafka/config/connect-log4j2.yaml
+COPY docker/start-kafka-connect.sh /app/start-kafka-connect.sh
 RUN chmod +x /app/start-kafka-connect.sh
 
 ENV KAFKA_HEAP_OPTS="-XX:InitialRAMPercentage=25.0 -XX:MaxRAMPercentage=75.0"
