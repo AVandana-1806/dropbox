@@ -1,1 +1,12 @@
- WARN [cares-snowflake-connector-cares300|task-3] [Consumer clientId=connector-consumer-cares-snowflake-connector-cares300-3, groupId=connect-cares-snowflake-connector-cares300] Bootstrap broker b-3.xxxx.c8.kafka.us-west-2.amazonaws.com:9094 (id: -1 rack: null isFenced: false) disconnected (org.apache.kafka.clients.NetworkClient:1255)
+Subject: cares-snowflake-connector rename (blocking mTLS)
+
+Hi <Developer>,
+
+The cares-snowflake-connector doesn't load Snowflake. It just moves messages from <topic A> to <topic B>. Our other Kafka Connect cluster on ECS does the actual Snowflake load.
+
+The name clashes with that one, and it's blocking the mTLS work.
+
+Can you confirm what it does and rename it to match?
+
+Thanks,
+Adarsh
