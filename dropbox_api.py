@@ -1,21 +1,10 @@
-@dataclass(frozen=True)
-class DeployConfig:
-    """Resolved settings for one deployment."""
-
-    stack_name: str
-    image_uri: str
-    connector_name: str
-    properties_path: str
-    ready_timeout_seconds: int
-    running_timeout_seconds: int
-    poll_seconds: int
-
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "DeployConfig":
         """Build the config from command-line arguments."""
         parser = argparse.ArgumentParser(description="Roll out an image and apply the connector config.")
         parser.add_argument("--stack-name", required=True)
         parser.add_argument("--image-uri", required=True)
+        parser.add_argument("--rest-url", required=True, type=lambda url: url.rstrip("/"))
         parser.add_argument("--connector-name", required=True)
         parser.add_argument("--properties", required=True, dest="properties_path")
         parser.add_argument("--ready-timeout", type=int, default=300, dest="ready_timeout_seconds")
