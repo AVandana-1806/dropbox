@@ -1,100 +1,49 @@
-#!/bin/sh
-# Start a Kafka Connect worker in distributed mode on ECS Fargate, connecting to MSK over mTLS.
-# Derives advertised host, env, region, group.id, storage topics and MSK bootstrap servers from ECS
-# task metadata and the AWS CLI. The root filesystem is read-only; /app is the task's own writable volume,
-# so the properties are edited in place like the Snowflake worker. The client certificate, chain and encrypted
-# key (fetched from Secrets Manager below) are written to CLIENT_PEM, which every ssl.keystore.location points
-# to; the key password stays in MSK_CLIENT_KEY_PASSWORD and is read through the env config provider.
+# Shared Kafka Connect worker image. One build per connector:
+#   docker build -f docker/Dockerfile --build-arg CONNECTOR=<name> --build-context connector=<source> -t <image> .
+# docker/<CONNECTOR>/ holds build-plugin.sh, start-kafka-connect.sh, connect-distributed.properties and
+# connect-log4j2.yaml. build-plugin.sh builds or downloads the connector's jars into /plugins/<plugin name>/.
+# "connector" is the connector's source code (repo B for Civica); a connector with no source code passes its
+# own docker/<CONNECTOR> folder.
+ARG CONNECTOR
 
-set -eu
+FROM maven:3.9-eclipse-temurin-21 AS plugin
+ARG CONNECTOR
+ARG VERSION=1.0.0-SNAPSHOT
+ENV VERSION=${VERSION}
+COPY --from=connector . /src
+COPY docker/${CONNECTOR}/ /conf/
+# The Maven cache persists between builds, so dependencies are not downloaded every time.
+RUN --mount=type=cache,target=/root/.m2 sh /conf/build-plugin.sh
 
-PROPS=/app/kafka/config/connect-distributed.properties
-CLIENT_PEM=/app/certs/client.pem
+FROM amazoncorretto:21-al2023-headless
 
-require() {
-	if [ -z "$2" ] || [ "$2" = "null" ]; then
-		echo "ERROR: could not resolve $1" >&2
-		exit 1
-	fi
-}
+ARG CONNECTOR
+ARG SCALA_VERSION=2.13
+# Match the connect-api version the connector is built against.
+ARG KAFKA_VERSION=4.2.0
 
-# Print one key of a secret's JSON value.
-secret_key() {
-	printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty'
-}
+RUN dnf install -y awscli-2 jq tar gzip \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
-set_prop() {
-	if grep -q "^$1=" "$PROPS"; then
-		sed -i "s|^$1=.*|$1=$2|" "$PROPS"
-	else
-		echo "$1=$2" >>"$PROPS"
-	fi
-}
+RUN mkdir -p /app/kafka /app/tmp \
+    && curl -fsSL https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_${SCALA_VERSION}-${KAFKA_VERSION}.tgz \
+       | tar -xz -C /app/kafka --strip-components=1
 
-echo "Starting Kafka Connect worker in distributed mode"
+# plugin.path=/app/plugins; each subfolder is one plugin.
+COPY --from=plugin /plugins/ /app/plugins/
 
-CONTAINER_META=$(curl -sf "${ECS_CONTAINER_METADATA_URI_V4}")
-TASK_META=$(curl -sf "${ECS_CONTAINER_METADATA_URI_V4}/task")
+COPY docker/${CONNECTOR}/connect-distributed.properties /app/kafka/config/connect-distributed.properties
+# Console-only logging (CloudWatch), so no connect.log builds up inside the task.
+COPY docker/${CONNECTOR}/connect-log4j2.yaml /app/kafka/config/connect-log4j2.yaml
+COPY docker/${CONNECTOR}/start-kafka-connect.sh /app/start-kafka-connect.sh
+RUN chmod +x /app/start-kafka-connect.sh
 
-KAFKA_CONTAINER_HOSTNAME=$(echo "$CONTAINER_META" | jq -r '.Networks[0].IPv4Addresses[0]')
-KAFKA_CONTAINER_ENVIRONMENT=$(echo "$CONTAINER_META" | jq -r '.Name' | sed 's/.*-//')
-SERVICE_NAME=$(echo "$TASK_META" | jq -r '.Family')
-REGION=${AWS_REGION:-$(echo "$TASK_META" | jq -r '.TaskARN' | cut -d: -f4)}
+ENV KAFKA_HEAP_OPTS="-XX:InitialRAMPercentage=25.0 -XX:MaxRAMPercentage=75.0"
 
-require KAFKA_CONTAINER_HOSTNAME "$KAFKA_CONTAINER_HOSTNAME"
-require KAFKA_CONTAINER_ENVIRONMENT "$KAFKA_CONTAINER_ENVIRONMENT"
-require SERVICE_NAME "$SERVICE_NAME"
-require REGION "$REGION"
+# The task runs with readonlyRootFilesystem and mounts a volume at /app; ECS copies the image's /app into
+# it at task start, so /app is the task's own writable copy. Must come after every step that writes /app.
+VOLUME ["/app"]
 
-MSK_CLIENT_SECRET_NAME="civica-connect/${KAFKA_CONTAINER_ENVIRONMENT}/msk-client-cert"
-
-MSK_CLIENT_SECRET=$(aws secretsmanager get-secret-value --region "$REGION" \
-	--secret-id "$MSK_CLIENT_SECRET_NAME" --query SecretString --output text)
-require "secret ${MSK_CLIENT_SECRET_NAME}" "$MSK_CLIENT_SECRET"
-
-MSK_CLIENT_KEY=$(secret_key "$MSK_CLIENT_SECRET" private_key)
-MSK_CLIENT_CERT=$(secret_key "$MSK_CLIENT_SECRET" certificate)
-MSK_CLIENT_CERT_CHAIN=$(secret_key "$MSK_CLIENT_SECRET" certificate_chain)
-MSK_CLIENT_KEY_PASSWORD=$(secret_key "$MSK_CLIENT_SECRET" private_key_password)
-require "${MSK_CLIENT_SECRET_NAME}:private_key" "$MSK_CLIENT_KEY"
-require "${MSK_CLIENT_SECRET_NAME}:certificate" "$MSK_CLIENT_CERT"
-require "${MSK_CLIENT_SECRET_NAME}:certificate_chain" "$MSK_CLIENT_CERT_CHAIN"
-require "${MSK_CLIENT_SECRET_NAME}:private_key_password" "$MSK_CLIENT_KEY_PASSWORD"
-
-# One PEM file with the encrypted private key, client certificate and CA chain; readable by this user only.
-mkdir -p "$(dirname "$CLIENT_PEM")"
-(umask 077 && printf '%s\n%s\n%s\n' "$MSK_CLIENT_KEY" "$MSK_CLIENT_CERT" "$MSK_CLIENT_CERT_CHAIN" >"$CLIENT_PEM")
-export MSK_CLIENT_KEY_PASSWORD
-
-KAFKA_MSK_CLUSTER_ARN=$(aws kafka list-clusters --region "$REGION" |
-	jq -r --arg name "cdi-db-infra--msk-cluster--${KAFKA_CONTAINER_ENVIRONMENT}" \
-		'.ClusterInfoList[] | select(.ClusterName == $name) | .ClusterArn')
-require KAFKA_MSK_CLUSTER_ARN "$KAFKA_MSK_CLUSTER_ARN"
-
-# mTLS listener (port 9094)
-KAFKA_MSK_BOOTSTRAP_SERVERS=$(aws kafka get-bootstrap-brokers --region "$REGION" \
-	--cluster-arn "$KAFKA_MSK_CLUSTER_ARN" | jq -r '.BootstrapBrokerStringTls')
-require KAFKA_MSK_BOOTSTRAP_SERVERS "$KAFKA_MSK_BOOTSTRAP_SERVERS"
-
-set_prop bootstrap.servers "$KAFKA_MSK_BOOTSTRAP_SERVERS"
-set_prop rest.advertised.host.name "$KAFKA_CONTAINER_HOSTNAME"
-set_prop group.id "$SERVICE_NAME"
-set_prop config.storage.topic "${SERVICE_NAME}-configs"
-set_prop offset.storage.topic "${SERVICE_NAME}-offsets"
-set_prop status.storage.topic "${SERVICE_NAME}-status"
-
-echo "=== Kafka Connect Config ==="
-echo "  region:                    ${REGION}"
-echo "  environment:               ${KAFKA_CONTAINER_ENVIRONMENT}"
-echo "  bootstrap.servers:         ${KAFKA_MSK_BOOTSTRAP_SERVERS}"
-echo "  rest.advertised.host.name: ${KAFKA_CONTAINER_HOSTNAME}"
-echo "  group.id:                  ${SERVICE_NAME}"
-echo "  config.storage.topic:      ${SERVICE_NAME}-configs"
-echo "  offset.storage.topic:      ${SERVICE_NAME}-offsets"
-echo "  status.storage.topic:      ${SERVICE_NAME}-status"
-echo "  msk client secret:         ${MSK_CLIENT_SECRET_NAME} -> ${CLIENT_PEM}"
-echo "============================"
-
-# Native libraries (zstd, snappy) extract to java.io.tmpdir, which must be writable (/app is the task volume).
-export KAFKA_OPTS="${KAFKA_OPTS:-} -Djava.io.tmpdir=/app/tmp -XX:-UsePerfData"
-exec /app/kafka/bin/connect-distributed.sh "$PROPS"
+EXPOSE 8083
+ENTRYPOINT ["/app/start-kafka-connect.sh"]
