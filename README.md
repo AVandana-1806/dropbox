@@ -1,6 +1,15 @@
-        p.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        p.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        // Pass any other "cares.producer.*" property straight to the producer (e.g. security.protocol, ssl.*).
-        p.putAll(cfg.originalsWithPrefix("cares.producer."));
+{
+    "timestamp": "2026-11-06T17:17:47Z",
+    "level": "ERROR",
+    "message": "<KafkaTCPTransport [xxxxx:9094<-58458]>: socket disconnected",
+    "logger": "kafka.net.transport",
+    "requestId": "0a168a67-40a2-4cf1-9287-078c7a0f0b4f"
+}
 
-        this.producer = new KafkaProducer<>(p);
+{
+    "timestamp": "2026-11-06T17:17:47Z",
+    "level": "INFO",
+    "message": "<KafkaTCPTransport [xxxxx:9094<-58462]>: connected to <socket.socket fd=9, family=2, type=1, proto=6, laddr=('169.254.100.6', 58462), raddr=('xxxxx', 9094)>",
+    "logger": "kafka.net.transport",
+    "requestId": "0a168a67-40a2-4cf1-9287-078c7a0f0b4f"
+}
