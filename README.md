@@ -1,5 +1,6 @@
-[2026-11-06 00:52:44,705] INFO [Producer clientId=cares-custom-sink-producer] Cancelled in-flight API_VERSIONS request with correlation id 517 due to node -2 being disconnected (elapsed time since creation: 26ms, elapsed time since send: 26ms, throttle time: 0ms, request timeout: 30000ms) (org.apache.kafka.clients.NetworkClient:411)
+        p.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        p.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        // Pass any other "cares.producer.*" property straight to the producer (e.g. security.protocol, ssl.*).
+        p.putAll(cfg.originalsWithPrefix("cares.producer."));
 
-[2026-11-06 00:52:44,705] WARN [Producer clientId=cares-custom-sink-producer] Bootstrap broker xxx.us-west-2.amazonaws.com:9094 (id: -2 rack: null isFenced: false) disconnected (org.apache.kafka.clients.NetworkClient:1255)
-
-[2026-11-06 00:52:44,705] INFO [Producer clientId=cares-custom-sink-producer] Node -2 disconnected. (org.apache.kafka.clients.NetworkClient:1072)
+        this.producer = new KafkaProducer<>(p);
