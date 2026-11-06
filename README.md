@@ -1,21 +1,5 @@
-# Statuses Connect returns while workers start, rebalance or hand over leadership; the same call succeeds later.
-RETRY_STATUSES = frozenset({409, 500, 503})
-# 400 while the validating worker hasn't loaded the plugin yet (e.g. just after a rollout).
-PLUGIN_NOT_LOADED = "Failed to find any class that implements Connector"
+[2026-11-06 00:52:44,705] INFO [Producer clientId=cares-custom-sink-producer] Cancelled in-flight API_VERSIONS request with correlation id 517 due to node -2 being disconnected (elapsed time since creation: 26ms, elapsed time since send: 26ms, throttle time: 0ms, request timeout: 30000ms) (org.apache.kafka.clients.NetworkClient:411)
 
+[2026-11-06 00:52:44,705] WARN [Producer clientId=cares-custom-sink-producer] Bootstrap broker b-3.cdidbinframskclusterca.u9j9as.c8.kafka.us-west-2.amazonaws.com:9094 (id: -2 rack: null isFenced: false) disconnected (org.apache.kafka.clients.NetworkClient:1255)
 
-    def put_config(self, connector_config: dict):
-        """Create or update the connector, retrying while workers start or rebalance."""
-        deadline = time.monotonic() + self.config.ready_timeout_seconds
-        while True:
-            status, body = self.client.request("PUT", self.path + "/config", connector_config)
-            if status in (200, 201):
-                LOGGER.info("Connector '%s' %s.", self.config.connector_name,
-                            "created" if status == 201 else "updated")
-                return
-            message = (body or {}).get("message", "")
-            retryable = status in RETRY_STATUSES or (status == 400 and PLUGIN_NOT_LOADED in message)
-            if not retryable or time.monotonic() > deadline:
-                raise DeployError(f"PUT config failed with {status}: {body}")
-            LOGGER.info("Connect not ready for this config (%s): %s; retrying", status, message)
-            time.sleep(self.config.poll_seconds)
+[2026-11-06 00:52:44,705] INFO [Producer clientId=cares-custom-sink-producer] Node -2 disconnected. (org.apache.kafka.clients.NetworkClient:1072)
