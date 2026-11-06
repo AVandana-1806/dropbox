@@ -13,14 +13,11 @@ ENCRYPTION_MODE = CBC
 ENV ?= dev
 DEPLOYMENT_UNIT ?= my-app
 UPPER_ENV := $(shell echo $(ENV) | tr '[:lower:]' '[:upper:]')
-MTLS_SECRET_NAME ?= kafka-mtls-credentials-$(ENV)
 MTLS ?= false
-# Extra `openssl pkcs12 -export` options; set to -legacy if the Mule runtime's JDK predates 8u301 / 11.0.12.
-PKCS12_OPTS ?=
 CERT_DIR = $(CODEBUILD_SRC_DIR_SourceArtifact)/$(DEPLOYMENT_UNIT)/certs
 
-# Validate required variables
-ifeq (,$(filter clean,$(MAKECMDGOALS)))
+# Validate required variables, unless only clean and/or generate_p12 are requested (they don't use them)
+ifneq (,$(filter-out clean generate_p12,$(or $(MAKECMDGOALS),all)))
 
   ifndef ENCRYPT_KEY
     $(error ❌ ERROR: ENCRYPT_KEY is required. Please provide encryption key using ENCRYPT_KEY=your_key)
@@ -32,6 +29,21 @@ ifeq (,$(filter clean,$(MAKECMDGOALS)))
 
   ifndef DEPLOYMENT_PATH
     $(error ❌ ERROR: DEPLOYMENT_PATH is required. Please provide the output folder using DEPLOYMENT_PATH=path)
+  endif
+
+endif
+
+# P12 files are built when MTLS=true (e.g. with all), or always when generate_p12 is requested directly;
+# only then are the mTLS variables required.
+BUILD_P12 := $(if $(or $(filter generate_p12,$(MAKECMDGOALS)),$(filter true,$(MTLS))),true,false)
+ifeq ($(BUILD_P12),true)
+
+  ifndef MTLS_SECRET_NAME
+    $(error ❌ ERROR: MTLS_SECRET_NAME is required for mTLS. Please provide the client certificate secret using MTLS_SECRET_NAME=secret_name)
+  endif
+
+  ifndef CODEBUILD_SRC_DIR_SourceArtifact
+    $(error ❌ ERROR: CODEBUILD_SRC_DIR_SourceArtifact is required for mTLS. Please provide the source folder the certs are written under)
   endif
 
 endif
@@ -83,7 +95,7 @@ generate_p12:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "🔐 Generating P12 Keystore and Truststore"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	if [[ "$(MTLS)" != "true" ]]; then
+	if [[ "$(BUILD_P12)" != "true" ]]; then
 		echo "  ↷ Skipping P12 generation: MTLS is not true."
 		exit 0
 	fi
@@ -101,16 +113,18 @@ generate_p12:
 	cp "$$temp_dir/password" "$$temp_dir/store-password"
 	mkdir -p "$(CERT_DIR)"
 
-	openssl pkcs12 -export $(PKCS12_OPTS) -in "$$temp_dir/keystore.pem" \
+	openssl pkcs12 -export -in "$$temp_dir/keystore.pem" \
 		-inkey "$$temp_dir/keystore.pem" -out "$(CERT_DIR)/client-keystore.p12" \
 		-name "kafka-client" -passin "file:$$temp_dir/password" \
 		-passout "file:$$temp_dir/store-password"
 
 	# keytool imports only the first certificate of a file, so split the bundle and import each one.
 	rm -f "$(CERT_DIR)/client-truststore.p12"
-	keytool -importcert -noprompt -alias "msk-ca" -file "$$temp_dir/ca.pem" \
-		-keystore "$(CERT_DIR)/client-truststore.p12" -storetype PKCS12 \
-		-storepass:file "$$temp_dir/password"
+	awk -v dir="$$temp_dir" '/BEGIN CERTIFICATE/ { n++ } n { print > (dir "/ca-" n ".pem") }' "$$temp_dir/ca.pem"
+	for ca in "$$temp_dir"/ca-*.pem; do
+		keytool -importcert -noprompt -alias "msk-$$(basename "$$ca" .pem)" -file "$$ca" \
+			-keystore "$(CERT_DIR)/client-truststore.p12" -storetype PKCS12 \
+			-storepass:file "$$temp_dir/password"
 	done
 	echo "  ✓ P12 keystore and truststore ($$(ls "$$temp_dir"/ca-*.pem | wc -l) CA) created in $(CERT_DIR)"
 	echo ""
