@@ -108,11 +108,9 @@ generate_p12:
 
 	# keytool imports only the first certificate of a file, so split the bundle and import each one.
 	rm -f "$(CERT_DIR)/client-truststore.p12"
-	awk -v dir="$$temp_dir" '/BEGIN CERTIFICATE/ { n++ } n { print > (dir "/ca-" n ".pem") }' "$$temp_dir/ca.pem"
-	for ca in "$$temp_dir"/ca-*.pem; do
-		keytool -importcert -noprompt -alias "msk-$$(basename "$$ca" .pem)" -file "$$ca" \
-			-keystore "$(CERT_DIR)/client-truststore.p12" -storetype PKCS12 \
-			-storepass:file "$$temp_dir/password"
+	keytool -importcert -noprompt -alias "msk-ca" -file "$$temp_dir/ca.pem" \
+		-keystore "$(CERT_DIR)/client-truststore.p12" -storetype PKCS12 \
+		-storepass:file "$$temp_dir/password"
 	done
 	echo "  ✓ P12 keystore and truststore ($$(ls "$$temp_dir"/ca-*.pem | wc -l) CA) created in $(CERT_DIR)"
 	echo ""
