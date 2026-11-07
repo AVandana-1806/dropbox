@@ -13,7 +13,6 @@ ENCRYPTION_MODE = CBC
 ENV ?= dev
 DEPLOYMENT_UNIT ?= my-app
 UPPER_ENV := $(shell echo $(ENV) | tr '[:lower:]' '[:upper:]')
-MTLS ?= false
 CERT_DIR = $(CODEBUILD_SRC_DIR_SourceArtifact)/$(DEPLOYMENT_UNIT)/certs
 
 # Validate required variables, unless only clean and/or generate_p12 are requested (they don't use them)
@@ -33,17 +32,11 @@ ifneq (,$(filter-out clean generate_p12,$(or $(MAKECMDGOALS),all)))
 
 endif
 
-# P12 files are built when MTLS=true (e.g. with all), or always when generate_p12 is requested directly;
-# only then are the mTLS variables required.
-BUILD_P12 := $(if $(or $(filter generate_p12,$(MAKECMDGOALS)),$(filter true,$(MTLS))),true,false)
-ifeq ($(BUILD_P12),true)
+# generate_p12 runs only when requested directly (not part of all); only then is the mTLS variable required.
+ifneq (,$(filter generate_p12,$(MAKECMDGOALS)))
 
   ifndef MTLS_SECRET_NAME
     $(error ❌ ERROR: MTLS_SECRET_NAME is required for mTLS. Please provide the client certificate secret using MTLS_SECRET_NAME=secret_name)
-  endif
-
-  ifndef CODEBUILD_SRC_DIR_SourceArtifact
-    $(error ❌ ERROR: CODEBUILD_SRC_DIR_SourceArtifact is required for mTLS. Please provide the source folder the certs are written under)
   endif
 
 endif
@@ -59,7 +52,7 @@ SECURE_ENV_FILE = $(DEPLOYMENT_PATH)/$(UPPER_ENV)-secure.properties
 # Main Targets
 # ===============================
 
-all: banner generate_env_file generate_p12 encrypt_secrets cleanup
+all: banner generate_env_file encrypt_secrets cleanup
 	@echo ""
 	@echo "════════════════════════════════════════════════════════════"
 	@echo "✅ Build Complete - All property files generated"
@@ -95,10 +88,6 @@ generate_p12:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "🔐 Generating P12 Keystore and Truststore"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	if [[ "$(BUILD_P12)" != "true" ]]; then
-		echo "  ↷ Skipping P12 generation: MTLS is not true."
-		exit 0
-	fi
 	temp_dir=$$(mktemp -d)
 	trap 'rm -rf -- "$$temp_dir"' EXIT
 	umask 077
